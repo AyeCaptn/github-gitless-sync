@@ -1,13 +1,9 @@
-import {
-  EventRef,
-  Plugin,
-  WorkspaceLeaf,
-  normalizePath,
-  Notice,
-} from "obsidian";
+import { EventRef, Plugin, WorkspaceLeaf, Notice } from "obsidian";
 import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
 import SyncManager, { ConflictFile, ConflictResolution } from "./sync-manager";
+import SyncStatusModal from "./views/sync-status-modal";
+import FileExplorerBadges from "./file-explorer-badges";
 import Logger from "./logger";
 import {
   ConflictsResolutionView,
@@ -18,6 +14,7 @@ export default class GitHubSyncPlugin extends Plugin {
   settings: GitHubSyncSettings;
   syncManager: SyncManager;
   logger: Logger;
+  fileExplorerBadges: FileExplorerBadges;
 
   statusBarItem: HTMLElement | null = null;
   syncRibbonIcon: HTMLElement | null = null;
@@ -96,6 +93,7 @@ export default class GitHubSyncPlugin extends Plugin {
       this.onConflicts.bind(this),
       this.logger,
     );
+    this.fileExplorerBadges = new FileExplorerBadges(this.syncManager);
     await this.syncManager.loadMetadata();
 
     if (this.settings.syncStrategy == "interval") {
@@ -122,7 +120,21 @@ export default class GitHubSyncPlugin extends Plugin {
       if (this.settings.showSyncRibbonButton) {
         this.showSyncRibbonIcon();
       }
+
+      if (this.settings.showFileExplorerBadges) {
+        this.showFileExplorerBadges();
+      }
     });
+
+    this.registerEvent(
+      this.app.vault.on("delete", () => this.refreshExplorerBadges()),
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", () => this.refreshExplorerBadges()),
+    );
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => this.refreshExplorerBadges()),
+    );
 
     this.addCommand({
       id: "sync-files",
@@ -138,6 +150,14 @@ export default class GitHubSyncPlugin extends Plugin {
       repeatable: false,
       icon: "refresh-cw",
       callback: this.openConflictsView.bind(this),
+    });
+
+    this.addCommand({
+      id: "show-sync-status",
+      name: "Show sync status",
+      repeatable: false,
+      icon: "list",
+      callback: this.showSyncStatus.bind(this),
     });
   }
 
@@ -156,7 +176,7 @@ export default class GitHubSyncPlugin extends Plugin {
       try {
         await this.syncManager.firstSync();
         this.settings.firstSync = false;
-        this.saveSettings();
+        await this.saveSettings();
         // Shown only if sync doesn't fail
         new Notice("Sync successful", 5000);
       } catch (err) {
@@ -169,10 +189,12 @@ export default class GitHubSyncPlugin extends Plugin {
       await this.syncManager.sync();
     }
     this.updateStatusBarItem();
+    this.refreshExplorerBadges();
   }
 
   async onunload() {
     this.stopSyncInterval();
+    this.hideFileExplorerBadges();
   }
 
   showStatusBarItem() {
@@ -180,23 +202,36 @@ export default class GitHubSyncPlugin extends Plugin {
       return;
     }
     this.statusBarItem = this.addStatusBarItem();
+    this.statusBarItem.classList.add("mod-clickable");
+    this.statusBarItem.setAttribute("aria-label", "Show GitHub sync status");
+    this.statusBarItem.setAttribute("title", "Click to show GitHub sync status");
+    this.statusBarItem.addEventListener("click", () => {
+      void this.showSyncStatus();
+    });
 
     if (!this.activeLeafChangeListener) {
       this.activeLeafChangeListener = this.app.workspace.on(
         "active-leaf-change",
-        () => this.updateStatusBarItem(),
+        () => {
+          this.updateStatusBarItem();
+          this.refreshExplorerBadges();
+        },
       );
     }
     if (!this.vaultCreateListener) {
       this.vaultCreateListener = this.app.vault.on("create", () => {
         this.updateStatusBarItem();
+        this.refreshExplorerBadges();
       });
     }
     if (!this.vaultModifyListener) {
       this.vaultModifyListener = this.app.vault.on("modify", () => {
         this.updateStatusBarItem();
+        this.refreshExplorerBadges();
       });
     }
+
+    void this.updateStatusBarItem();
   }
 
   hideStatusBarItem() {
@@ -204,26 +239,37 @@ export default class GitHubSyncPlugin extends Plugin {
     this.statusBarItem = null;
   }
 
-  updateStatusBarItem() {
+  async updateStatusBarItem() {
     if (!this.statusBarItem) {
       return;
     }
     const activeFile = this.app.workspace.getActiveFile();
     if (!activeFile) {
+      this.statusBarItem.setText("GitHub: Ready");
       return;
     }
 
-    let state = "Unknown";
-    const fileData = this.syncManager.getFileMetadata(activeFile.path);
-    if (!fileData) {
-      state = "Untracked";
-    } else if (fileData.dirty) {
-      state = "Outdated";
-    } else if (!fileData.dirty) {
-      state = "Up to date";
-    }
-
+    const state = await this.syncManager.getLocalFileSyncState(activeFile.path);
     this.statusBarItem.setText(`GitHub: ${state}`);
+    this.statusBarItem.setAttribute(
+      "title",
+      `${activeFile.path}\n${state}\nClick to show GitHub sync status`,
+    );
+  }
+
+  showFileExplorerBadges() {
+    this.fileExplorerBadges.start();
+  }
+
+  hideFileExplorerBadges() {
+    this.fileExplorerBadges.stop();
+  }
+
+  refreshExplorerBadges() {
+    if (!this.settings.showFileExplorerBadges) {
+      return;
+    }
+    this.fileExplorerBadges.refresh();
   }
 
   showSyncRibbonIcon() {
@@ -272,12 +318,66 @@ export default class GitHubSyncPlugin extends Plugin {
     });
   }
 
+  async showSyncStatus() {
+    if (
+      this.settings.githubToken === "" ||
+      this.settings.githubOwner === "" ||
+      this.settings.githubRepo === "" ||
+      this.settings.githubBranch === ""
+    ) {
+      new Notice("Sync plugin not configured");
+      return;
+    }
+
+    const loadingNotice = new Notice("Loading sync status...");
+    try {
+      const status = await this.syncManager.getSyncStatus();
+      new SyncStatusModal(this.app, status).open();
+    } catch (err) {
+      new Notice(`Error loading sync status. ${err}`);
+    } finally {
+      loadingNotice.hide();
+    }
+  }
+
+  private getTokenStorageKey() {
+    return `${this.manifest.id}:${this.app.vault.getName()}:githubToken`;
+  }
+
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const savedSettings = Object.assign(
+      {},
+      DEFAULT_SETTINGS,
+      await this.loadData(),
+    ) as GitHubSyncSettings;
+    let token = window.localStorage.getItem(this.getTokenStorageKey()) || "";
+
+    if (savedSettings.githubToken !== "") {
+      token = savedSettings.githubToken;
+      window.localStorage.setItem(this.getTokenStorageKey(), token);
+      savedSettings.githubToken = "";
+      await this.saveData(savedSettings);
+    }
+
+    this.settings = {
+      ...savedSettings,
+      githubToken: token,
+    };
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    if (this.settings.githubToken === "") {
+      window.localStorage.removeItem(this.getTokenStorageKey());
+    } else {
+      window.localStorage.setItem(
+        this.getTokenStorageKey(),
+        this.settings.githubToken,
+      );
+    }
+    await this.saveData({
+      ...this.settings,
+      githubToken: "",
+    });
   }
 
   // Proxy methods from sync manager to ease handling the interval
@@ -299,8 +399,9 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 
   async reset() {
-    this.settings = DEFAULT_SETTINGS;
-    this.saveSettings();
+    this.settings = { ...DEFAULT_SETTINGS };
+    window.localStorage.removeItem(this.getTokenStorageKey());
+    await this.saveSettings();
     await this.syncManager.resetMetadata();
   }
 }

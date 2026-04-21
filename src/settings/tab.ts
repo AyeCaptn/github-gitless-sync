@@ -28,7 +28,7 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("GitHub token")
       .setDesc(
-        "A personal access token or a fine-grained token with read and write access to your repository",
+        "A personal access token or a fine-grained token with read and write access to your repository. The token is stored only on this device and is not synced to GitHub.",
       )
       .addButton((button) =>
         button.setIcon("eye-off").onClick((e) => {
@@ -153,7 +153,9 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync configs")
-      .setDesc("Sync Vault config folder with remote repository")
+      .setDesc(
+        "Sync Vault config folder with remote repository. The plugin token is excluded and stays local to this device.",
+      )
       .addToggle((toggle) => {
         toggle
           .setValue(this.plugin.settings.syncConfigDir)
@@ -193,13 +195,34 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Show status bar item")
-      .setDesc("Displays the status bar item that show the file sync status")
+      .setDesc(
+        "Displays the status bar item with the active file sync state. Click it to see a detailed sync status overview.",
+      )
       .addToggle((toggle) => {
         toggle
           .setValue(this.plugin.settings.showStatusBarItem)
           .onChange((value) => {
             this.plugin.settings.showStatusBarItem = value;
             this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Show file explorer badges")
+      .setDesc(
+        "Displays a small dot in the file explorer for files that are not currently synced.",
+      )
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.showFileExplorerBadges)
+          .onChange((value) => {
+            this.plugin.settings.showFileExplorerBadges = value;
+            this.plugin.saveSettings();
+            if (value) {
+              this.plugin.showFileExplorerBadges();
+            } else {
+              this.plugin.hideFileExplorerBadges();
+            }
           });
       });
 

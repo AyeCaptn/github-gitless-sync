@@ -11,6 +11,7 @@ export interface GitHubSyncSettings {
   conflictHandling: "overwriteLocal" | "ask" | "overwriteRemote";
   conflictViewMode: "default" | "unified" | "split";
   showStatusBarItem: boolean;
+  showFileExplorerBadges: boolean;
   showSyncRibbonButton: boolean;
   showConflictsRibbonButton: boolean;
   enableLogging: boolean;
@@ -29,6 +30,7 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   conflictHandling: "ask",
   conflictViewMode: "default",
   showStatusBarItem: true,
+  showFileExplorerBadges: true,
   showSyncRibbonButton: true,
   showConflictsRibbonButton: true,
   enableLogging: false,

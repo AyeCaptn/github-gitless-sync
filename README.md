@@ -15,6 +15,8 @@ These are the main features of the plugin:
 - Automatic sync on fixed interval
 - Manual sync
 - Conflict resolution view
+- Sync status overview for pending uploads, downloads, deletions, and conflicts
+- Per-file sync badges in the file explorer
 
 - Filtering by file type (TODO 🔨)
 
@@ -90,11 +92,10 @@ If you want to sync your vault configs with other vault you can enable that.
 It will sync the whole folder, that is `.obsidian` by default, including all plugins and themes.
 
 Note that the `.obsidian` folder will always be present, this happens because the plugin
-needs to store some metadata to correctly sync
+needs to store some metadata to correctly sync.
 
-> [!CAUTION]
-> DO NOT sync configs if your remote repository is public.
-> That will expose the token you used to sync.
+The GitHub token is stored only on the local device and is not written to the synced repository.
+Other plugins may still store sensitive settings in `.obsidian`, so review what you sync before using a public repo.
 
 ### Reset
 
@@ -120,11 +121,11 @@ Also since this relies only on the GitHub APIs you can only sync with GitHub and
 
 ### Can I use this with other sync plugins?
 
-No.
+Not together with other sync plugins.
 
-To work correctly this plugin uses a custom metadata file that is updated every time we sync, if you commit changes outside the plugin that file is not updated properly.
+This plugin uses a custom metadata file that is updated every time it syncs. If you commit changes outside the plugin, the plugin now tries to detect that drift and rebuild its metadata on the next sync, but using multiple sync tools at the same time can still cause conflicts or unexpected results.
 
-Other plugins don't know about that file, so if you sync with others too you risk losing data.
+If you only use regular `git` commands occasionally, the plugin should detect those remote changes on the next sync or in the sync status overview.
 
 ## Contributing
 
