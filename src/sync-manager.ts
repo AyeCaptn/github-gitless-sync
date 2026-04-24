@@ -360,13 +360,12 @@ export default class SyncManager {
       // API doesn't let us create a new tree when the repo is empty.
       // So we create a the manifest file as the first commit, since we're going
       // to create that in any case right after this.
-      const buffer = await this.vault.adapter.readBinary(
-        normalizePath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
-      );
+      const metadataContent = serializeMetadata(this.metadataStore.data);
+      const metadataBuffer = new TextEncoder().encode(metadataContent);
       const commitMessage = this.buildCommitMessage("First sync");
       await this.client.createFile({
         path: `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
-        content: arrayBufferToBase64(buffer),
+        content: arrayBufferToBase64(metadataBuffer.buffer),
         message: commitMessage,
         retry: true,
       });

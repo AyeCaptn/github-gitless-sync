@@ -37,25 +37,45 @@ export interface Metadata {
   files: { [key: string]: FileMetadata };
 }
 
+function canonicalizeFileMetadata(fileMetadata: FileMetadata): FileMetadata {
+  const canonicalMetadata: FileMetadata = {
+    path: fileMetadata.path,
+    sha: fileMetadata.sha,
+    dirty: fileMetadata.dirty,
+    justDownloaded: fileMetadata.justDownloaded,
+    lastModified: fileMetadata.lastModified,
+  };
+
+  if (fileMetadata.deleted !== undefined) {
+    canonicalMetadata.deleted = fileMetadata.deleted;
+  }
+
+  if (fileMetadata.deletedAt !== undefined) {
+    canonicalMetadata.deletedAt = fileMetadata.deletedAt;
+  }
+
+  return canonicalMetadata;
+}
+
 export function serializeMetadata(metadata: Metadata): string {
   const sortedFiles = Object.keys(metadata.files)
     .sort()
     .reduce(
       (acc: { [key: string]: FileMetadata }, filePath: string) => ({
         ...acc,
-        [filePath]: metadata.files[filePath],
+        [filePath]: canonicalizeFileMetadata(metadata.files[filePath]),
       }),
       {},
     );
 
-  return JSON.stringify(
+  return `${JSON.stringify(
     {
       lastSync: metadata.lastSync,
       files: sortedFiles,
     },
     null,
     2,
-  );
+  )}\n`;
 }
 
 /**
