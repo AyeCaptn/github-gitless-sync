@@ -1,4 +1,11 @@
-import { EventRef, Plugin, WorkspaceLeaf, Notice } from "obsidian";
+import {
+  EventRef,
+  Plugin,
+  WorkspaceLeaf,
+  Notice,
+  apiVersion,
+  requireApiVersion,
+} from "obsidian";
 import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
 import SyncManager, { ConflictFile, ConflictResolution } from "./sync-manager";
@@ -74,8 +81,77 @@ export default class GitHubSyncPlugin extends Plugin {
     workspace.revealLeaf(leaf);
   }
 
+  private normalizeVersion(version: string | null | undefined) {
+    if (!version) {
+      return null;
+    }
+
+    const match = version.match(/\d+(?:\.\d+)+/);
+    return match?.[0] || null;
+  }
+
+  private compareVersions(left: string, right: string) {
+    const leftParts = left.split(".").map((part) => parseInt(part, 10) || 0);
+    const rightParts = right.split(".").map((part) => parseInt(part, 10) || 0);
+    const length = Math.max(leftParts.length, rightParts.length);
+
+    for (let i = 0; i < length; i++) {
+      const leftPart = leftParts[i] || 0;
+      const rightPart = rightParts[i] || 0;
+      if (leftPart > rightPart) {
+        return 1;
+      }
+      if (leftPart < rightPart) {
+        return -1;
+      }
+    }
+
+    return 0;
+  }
+
+  private getCurrentAppVersion() {
+    const appVersion = this.normalizeVersion(
+      (this.app as unknown as { version?: string; appVersion?: string }).version ||
+        (this.app as unknown as { version?: string; appVersion?: string }).appVersion,
+    );
+    if (appVersion) {
+      return appVersion;
+    }
+
+    return this.normalizeVersion(apiVersion);
+  }
+
+  private isAppVersionSupported() {
+    const minimumVersion = this.normalizeVersion(this.manifest.minAppVersion);
+    if (!minimumVersion) {
+      return true;
+    }
+
+    try {
+      if (requireApiVersion(minimumVersion)) {
+        return true;
+      }
+    } catch {
+      // Fall back to manual comparison below.
+    }
+
+    const currentVersion = this.getCurrentAppVersion();
+    if (!currentVersion) {
+      return false;
+    }
+
+    return this.compareVersions(currentVersion, minimumVersion) >= 0;
+  }
+
   async onload() {
     await this.loadSettings();
+
+    if (!this.isAppVersionSupported()) {
+      new Notice(
+        `GitHub Gitless Sync requires Obsidian ${this.manifest.minAppVersion} or newer. Please update this device before syncing.`,
+        10000,
+      );
+    }
 
     this.logger = new Logger(this.app.vault, this.settings.enableLogging);
     this.logger.init();
@@ -162,6 +238,13 @@ export default class GitHubSyncPlugin extends Plugin {
   }
 
   async sync() {
+    if (!this.isAppVersionSupported()) {
+      new Notice(
+        `Please update Obsidian on this device to ${this.manifest.minAppVersion} or newer before syncing.`,
+      );
+      return;
+    }
+
     if (
       this.settings.githubToken === "" ||
       this.settings.githubOwner === "" ||

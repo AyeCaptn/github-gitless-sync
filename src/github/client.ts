@@ -1,4 +1,4 @@
-import { requestUrl } from "obsidian";
+import { requestUrl, RequestUrlResponse } from "obsidian";
 import Logger from "src/logger";
 import { GitHubSyncSettings } from "src/settings/settings";
 import { retryUntil } from "src/utils";
@@ -53,6 +53,7 @@ export type BlobFile = {
 class GithubAPIError extends Error {
   constructor(
     public status: number,
+    public context: string,
     message: string,
   ) {
     super(message);
@@ -73,6 +74,49 @@ export default class GithubClient {
     };
   }
 
+  private repoBaseUrl() {
+    return `https://api.github.com/repos/${encodeURIComponent(this.settings.githubOwner)}/${encodeURIComponent(this.settings.githubRepo)}`;
+  }
+
+  private encodedBranch() {
+    return encodeURIComponent(this.settings.githubBranch);
+  }
+
+  private encodedPath(path: string) {
+    return path
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+  }
+
+  private errorMessage(response: RequestUrlResponse) {
+    const jsonMessage = response.json?.message;
+    if (typeof jsonMessage === "string" && jsonMessage.length > 0) {
+      return jsonMessage;
+    }
+    if (typeof response.text === "string" && response.text.length > 0) {
+      return response.text;
+    }
+    return `status ${response.status}`;
+  }
+
+  private async throwApiError(
+    context: string,
+    response: RequestUrlResponse,
+  ): Promise<never> {
+    const message = this.errorMessage(response);
+    await this.logger.error(context, {
+      status: response.status,
+      message,
+      response: response.text || response.json,
+    });
+    throw new GithubAPIError(
+      response.status,
+      context,
+      `${context}: ${message} (status ${response.status})`,
+    );
+  }
+
   /**
    * Gets the content of the repo.
    *
@@ -87,7 +131,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees/${this.settings.githubBranch}?recursive=1`,
+          url: `${this.repoBaseUrl()}/git/trees/${this.encodedBranch()}?recursive=1`,
           headers: this.headers(),
           throw: false,
         });
@@ -97,11 +141,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to get repo content", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to get repo content, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to get repo content", response);
     }
 
     const files = response.json.tree
@@ -136,7 +176,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/trees`,
+          url: `${this.repoBaseUrl()}/git/trees`,
           headers: this.headers(),
           method: "POST",
           body: JSON.stringify(tree),
@@ -148,11 +188,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to create tree", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to create tree, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to create tree", response);
     }
     return response.json.sha;
   }
@@ -183,7 +219,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/commits`,
+          url: `${this.repoBaseUrl()}/git/commits`,
           headers: this.headers(),
           method: "POST",
           body: JSON.stringify({
@@ -199,11 +235,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to create commit", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to create commit, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to create commit", response);
     }
     return response.json.sha;
   }
@@ -219,7 +251,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}`,
+          url: `${this.repoBaseUrl()}/git/refs/heads/${this.encodedBranch()}`,
           headers: this.headers(),
           throw: false,
         });
@@ -229,10 +261,9 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to get branch head sha", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to get branch head sha, status ${response.status}`,
+      return await this.throwApiError(
+        "Failed to get branch head sha",
+        response,
       );
     }
     return response.json.object.sha;
@@ -257,7 +288,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/refs/heads/${this.settings.githubBranch}`,
+          url: `${this.repoBaseUrl()}/git/refs/heads/${this.encodedBranch()}`,
           headers: this.headers(),
           method: "PATCH",
           body: JSON.stringify({
@@ -271,10 +302,9 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to update branch head sha", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to update branch head sha, status ${response.status}`,
+      return await this.throwApiError(
+        "Failed to update branch head sha",
+        response,
       );
     }
   }
@@ -302,7 +332,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/blobs`,
+          url: `${this.repoBaseUrl()}/git/blobs`,
           headers: this.headers(),
           method: "POST",
           body: JSON.stringify({ content, encoding }),
@@ -314,11 +344,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to create blob", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to create blob, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to create blob", response);
     }
     return {
       sha: response.json["sha"],
@@ -345,7 +371,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/git/blobs/${sha}`,
+          url: `${this.repoBaseUrl()}/git/blobs/${encodeURIComponent(sha)}`,
           headers: this.headers(),
           throw: false,
         });
@@ -355,11 +381,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to get blob", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to get blob, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to get blob", response);
     }
     return response.json;
   }
@@ -389,7 +411,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/contents/${path}`,
+          url: `${this.repoBaseUrl()}/contents/${this.encodedPath(path)}`,
           headers: this.headers(),
           method: "PUT",
           body: JSON.stringify({
@@ -405,11 +427,7 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to create file", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to create file, status ${response.status}`,
-      );
+      return await this.throwApiError("Failed to create file", response);
     }
   }
 
@@ -427,7 +445,7 @@ export default class GithubClient {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `https://api.github.com/repos/${this.settings.githubOwner}/${this.settings.githubRepo}/zipball/${this.settings.githubBranch}`,
+          url: `${this.repoBaseUrl()}/zipball/${this.encodedBranch()}`,
           headers: this.headers(),
           method: "GET",
           throw: false,
@@ -438,10 +456,9 @@ export default class GithubClient {
     );
 
     if (response.status < 200 || response.status >= 400) {
-      await this.logger.error("Failed to download zip archive", response);
-      throw new GithubAPIError(
-        response.status,
-        `Failed to download zip archive, status ${response.status}`,
+      return await this.throwApiError(
+        "Failed to download zip archive",
+        response,
       );
     }
     return response.arrayBuffer;

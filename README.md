@@ -10,7 +10,7 @@ This might create problems for this plugin when determining what needs to be syn
 These are the main features of the plugin:
 
 - Desktop and mobile support
-- Doesn't require `git`
+- Works without `git`, but uses system `git` automatically when available
 - Multiple vaults sync
 - Automatic sync on fixed interval
 - Manual sync
@@ -39,7 +39,7 @@ Please also provide logs if possible, you can copy them from the settings page. 
 ### First sync
 
 > [!IMPORTANT]
-> The first sync will only work if either the remote repository or the local vault are completely **EMPTY**. If both contain files the first sync will fail.
+> The first sync also works when both the remote repository and the local vault already contain files. In that case the plugin reconciles both sides: local-only files are uploaded, remote-only files are downloaded, and files changed on both sides are resolved using the configured conflict handling.
 
 You must also configure the plugin settings before syncing.
 
@@ -65,6 +65,11 @@ I also suggest creating the token with access only to your sync repo.
 
 You can always sync manually by clicking the sync button in the side ribbon.
 This will always work even if sync on interval is enabled.
+
+On systems where `git` is installed and accessible, the plugin will automatically use the vault's real local git repository for sync operations.
+This keeps the local branch and refs in sync with GitHub instead of syncing through a temporary repository.
+In git CLI mode, the sync metadata file is regenerated from the final git state after each sync so API-based clients can keep working against the same repository.
+If `git` is not available, it falls back to the GitHub REST API, so it still works on mobile and other environments without `git`.
 
 ![Sync button](./assets/sync_button.png)
 
@@ -113,11 +118,11 @@ Most of those plugins though require the `git` executable to be present in your 
 
 This annoyed me because I wanted to have the same experience on every platform, and I wanted especially to support mobile.
 
-So I went a different way and chose to sync **only** with GitHub using their REST APIs, this means I don't rely in anyway on `git` being present in your system. This way I can easily support desktop and mobile with the same identical logic, and some small necessary differences in the UI for a better user experience.
+So I went a different way and chose to sync **only** with GitHub. The plugin still works without `git` by using the GitHub REST APIs, which keeps it usable on mobile and other environments where `git` is unavailable.
 
-This obviously comes with some limitations. Since `git` is not used you can't interact with your repository locally in any way, and any `git` feature like branching, merging, or rebasing, are not available at all.
+On desktop systems where `git` is installed and accessible, the plugin now automatically uses `git` for sync operations. This improves interoperability with normal git-based workflows while keeping the API-based fallback for portability.
 
-Also since this relies only on the GitHub APIs you can only sync with GitHub and no other host.
+Even when `git` is used, this plugin is still designed specifically for syncing with GitHub repositories, not for exposing full git workflows inside Obsidian. Features like arbitrary branching, merging, or rebasing are still outside the scope of the plugin UI.
 
 ### Can I use this with other sync plugins?
 
@@ -126,6 +131,8 @@ Not together with other sync plugins.
 This plugin uses a custom metadata file that is updated every time it syncs. If you commit changes outside the plugin, the plugin now tries to detect that drift and rebuild its metadata on the next sync, but using multiple sync tools at the same time can still cause conflicts or unexpected results.
 
 If you only use regular `git` commands occasionally, the plugin should detect those remote changes on the next sync or in the sync status overview.
+
+Sync commits now also use a more descriptive message format that includes the sync date/time and the number of changed files.
 
 ## Contributing
 

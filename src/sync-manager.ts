@@ -14,6 +14,7 @@ import MetadataStore, {
   FileMetadata,
   Metadata,
   MANIFEST_FILE_NAME,
+  serializeMetadata,
 } from "./metadata-store";
 import EventsListener from "./events-listener";
 import { GitHubSyncSettings } from "./settings/settings";
@@ -21,6 +22,8 @@ import Logger, { LOG_FILE_NAME } from "./logger";
 import { decodeBase64String, hasTextExtension } from "./utils";
 import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
+import GitCliSync from "./git-cli-sync";
+import SyncPathFilter from "./sync-path-filter";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -55,8 +58,10 @@ type OnConflictsCallback = (
 export default class SyncManager {
   private metadataStore: MetadataStore;
   private client: GithubClient;
+  private syncPathFilter: SyncPathFilter;
   private eventsListener: EventsListener;
   private syncIntervalId: number | null = null;
+  private gitCliSyncPromise: Promise<GitCliSync | null> | null = null;
 
   // Use to track if syncing is in progress, this ideally
   // prevents multiple syncs at the same time and creation
@@ -71,11 +76,211 @@ export default class SyncManager {
   ) {
     this.metadataStore = new MetadataStore(this.vault);
     this.client = new GithubClient(this.settings, this.logger);
+    this.syncPathFilter = new SyncPathFilter(this.vault, this.settings);
     this.eventsListener = new EventsListener(
       this.vault,
       this.metadataStore,
       this.settings,
       this.logger,
+      this.syncPathFilter,
+    );
+  }
+
+  private async getGitCliSync(): Promise<GitCliSync | null> {
+    if (this.gitCliSyncPromise !== null) {
+      return this.gitCliSyncPromise;
+    }
+
+    this.gitCliSyncPromise = (async () => {
+      if (!(await GitCliSync.isSupported())) {
+        return null;
+      }
+
+      if (!(await GitCliSync.isAvailableForVault(this.vault))) {
+        await this.logger.info(
+          "System git detected, but vault is not inside a git repository. Falling back to API sync",
+        );
+        return null;
+      }
+
+      await this.logger.info(
+        "System git detected and vault is inside a git repository, using git-backed sync",
+      );
+      return new GitCliSync(this.vault, this.settings, this.logger);
+    })();
+
+    return this.gitCliSyncPromise;
+  }
+
+  private async getRepoContent({ retry = false } = {}): Promise<RepoContent> {
+    const gitCliSync = await this.getGitCliSync();
+    if (gitCliSync !== null) {
+      return await gitCliSync.getRepoContent();
+    }
+
+    return await this.client.getRepoContent({ retry });
+  }
+
+  private async getBlob({ sha, retry = false }: { sha: string; retry?: boolean }) {
+    const gitCliSync = await this.getGitCliSync();
+    if (gitCliSync !== null) {
+      return await gitCliSync.getBlob({ sha });
+    }
+
+    return await this.client.getBlob({ sha, retry });
+  }
+
+  private getRemoteChangedPaths(
+    treeFiles: { [key: string]: NewTreeRequestItem },
+    actions: SyncAction[] = [],
+    conflictResolutions: ConflictResolution[] = [],
+  ) {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const changedPaths = new Set<string>();
+
+    actions.forEach((action) => {
+      if (action.type === "upload" || action.type === "delete_remote") {
+        if (action.filePath !== manifestPath) {
+          changedPaths.add(action.filePath);
+        }
+      }
+    });
+
+    conflictResolutions.forEach((resolution) => {
+      if (resolution.filePath !== manifestPath) {
+        changedPaths.add(resolution.filePath);
+      }
+    });
+
+    if (changedPaths.size === 0) {
+      Object.keys(treeFiles).forEach((filePath: string) => {
+        if (filePath === manifestPath) {
+          return;
+        }
+
+        if (
+          treeFiles[filePath].content !== undefined ||
+          treeFiles[filePath].sha === null
+        ) {
+          changedPaths.add(filePath);
+        }
+      });
+    }
+
+    return Array.from(changedPaths).sort();
+  }
+
+  private buildCommitMessage(
+    prefix: string,
+    treeFiles: { [key: string]: NewTreeRequestItem } = {},
+    actions: SyncAction[] = [],
+    conflictResolutions: ConflictResolution[] = [],
+  ) {
+    this.getRemoteChangedPaths(treeFiles, actions, conflictResolutions);
+    const timestamp = new Date()
+      .toISOString()
+      .replace("T", " ")
+      .replace(/\.\d{3}Z$/, " UTC");
+    return `${prefix} ${timestamp}`;
+  }
+
+  private shouldSyncPath(
+    filePath: string,
+    { includeManifest = true } = {},
+  ): boolean {
+    return this.syncPathFilter.shouldSyncPath(filePath, { includeManifest });
+  }
+
+  private async refreshSyncPathFilter() {
+    await this.syncPathFilter.refresh();
+  }
+
+  private async pruneUnsyncableMetadata() {
+    const { files, removedPaths } = this.syncPathFilter.pruneMetadata(
+      this.metadataStore.data.files,
+    );
+
+    if (removedPaths.length === 0) {
+      return;
+    }
+
+    this.metadataStore.data.files = files;
+    await this.metadataStore.save();
+    await this.logger.info("Pruned ignored files from metadata", removedPaths);
+  }
+
+  private async filterRemoteRepoFiles(
+    files: { [key: string]: GetTreeResponseItem },
+  ) {
+    const filteredFiles = this.syncPathFilter.filterRecord(files);
+    const localGitIgnoreExists = await this.vault.adapter.exists(
+      normalizePath(".gitignore"),
+    );
+
+    if (localGitIgnoreExists || files[".gitignore"] === undefined) {
+      return filteredFiles;
+    }
+
+    try {
+      const blob = await this.getBlob({
+        sha: files[".gitignore"].sha,
+        retry: true,
+      });
+      const remoteFilter = SyncPathFilter.fromGitIgnoreContent(
+        this.vault,
+        this.settings,
+        decodeBase64String(blob.content),
+      );
+      return remoteFilter.filterRecord(filteredFiles);
+    } catch (err) {
+      await this.logger.warn(
+        "Failed to load remote .gitignore, falling back to local rules",
+        err,
+      );
+      return filteredFiles;
+    }
+  }
+
+  private async getCurrentLocalFileSHAs() {
+    const fileSHAs: { [key: string]: string } = {};
+
+    await Promise.all(
+      Object.keys(this.metadataStore.data.files)
+        .filter((filePath: string) => this.shouldSyncPath(filePath, { includeManifest: false }))
+        .map(async (filePath: string) => {
+          const sha = await this.calculateSHA(filePath);
+          if (sha !== null) {
+            fileSHAs[filePath] = sha;
+          }
+        }),
+    );
+
+    return fileSHAs;
+  }
+
+  private async loadConflicts(
+    filePaths: string[],
+    remoteFiles: { [key: string]: GetTreeResponseItem },
+  ): Promise<ConflictFile[]> {
+    return await Promise.all(
+      filePaths.map(async (filePath: string) => {
+        const [remoteContent, localContent] = await Promise.all([
+          await (async () => {
+            const res = await this.getBlob({
+              sha: remoteFiles[filePath].sha,
+              retry: true,
+            });
+            return decodeBase64String(res.content);
+          })(),
+          await this.vault.adapter.read(normalizePath(filePath)),
+        ]);
+
+        return {
+          filePath,
+          remoteContent,
+          localContent,
+        };
+      }),
     );
   }
 
@@ -96,7 +301,6 @@ export default class SyncManager {
 
   /**
    * Handles first sync with remote and local.
-   * This fails if neither remote nor local folders are empty.
    */
   async firstSync() {
     if (this.syncing) {
@@ -117,6 +321,15 @@ export default class SyncManager {
 
   private async firstSyncImpl() {
     await this.logger.info("Starting first sync");
+    await this.refreshSyncPathFilter();
+    await this.pruneUnsyncableMetadata();
+
+    const gitCliSync = await this.getGitCliSync();
+    if (gitCliSync !== null) {
+      await this.syncWithGitCli(gitCliSync);
+      return;
+    }
+
     let repositoryIsEmpty = false;
     let res: RepoContent;
     let files: {
@@ -124,8 +337,8 @@ export default class SyncManager {
     } = {};
     let treeSha: string = "";
     try {
-      res = await this.client.getRepoContent();
-      files = res.files;
+      res = await this.getRepoContent();
+      files = await this.filterRemoteRepoFiles(res.files);
       treeSha = res.sha;
     } catch (err) {
       // 409 is returned in case the remote repo has been just created
@@ -150,25 +363,31 @@ export default class SyncManager {
       const buffer = await this.vault.adapter.readBinary(
         normalizePath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
       );
+      const commitMessage = this.buildCommitMessage("First sync");
       await this.client.createFile({
         path: `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
         content: arrayBufferToBase64(buffer),
-        message: "First sync",
+        message: commitMessage,
         retry: true,
       });
       // Now get the repo content again cause we know for sure it will return a
       // valid sha that we can use to create the first sync commit.
-      res = await this.client.getRepoContent({ retry: true });
-      files = res.files;
+      res = await this.getRepoContent({ retry: true });
+      files = await this.filterRemoteRepoFiles(res.files);
       treeSha = res.sha;
     }
 
     const vaultIsEmpty = await this.vaultIsEmpty();
 
     if (!repositoryIsEmpty && !vaultIsEmpty) {
-      // Both have files, we can't sync, show error
-      await this.logger.error("Both remote and local have files, can't sync");
-      throw new Error("Both remote and local have files, can't sync");
+      await this.logger.warn(
+        "Both remote and local already have files, reconciling first sync",
+      );
+      new Notice(
+        "Both remote and local already have files. Reconciling them for the first sync...",
+        7000,
+      );
+      await this.firstSyncFromBoth(files, treeSha);
     } else if (repositoryIsEmpty) {
       // Remote has no files and no manifest, let's just upload whatever we have locally.
       // This is fine even if the vault is empty.
@@ -181,6 +400,154 @@ export default class SyncManager {
       // In this case too the important step is that the remote manifest is created.
       await this.firstSyncFromRemote(files, treeSha);
     }
+  }
+
+  /**
+   * Handles first sync when both local and remote already contain files.
+   * Local-only files are uploaded, remote-only files are downloaded, and
+   * files that exist on both sides with different content are treated as conflicts.
+   */
+  private async firstSyncFromBoth(
+    files: { [key: string]: GetTreeResponseItem },
+    treeSha: string,
+  ) {
+    await this.logger.info("Starting first sync from both local and remote files");
+
+    if (
+      Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
+    ) {
+      delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
+    }
+
+    const localFiles = await this.getCurrentLocalFileSHAs();
+    const remoteFiles = Object.keys(files)
+      .filter((filePath: string) => this.shouldSyncPath(filePath, { includeManifest: false }))
+      .reduce(
+        (
+          acc: { [key: string]: GetTreeResponseItem },
+          filePath: string,
+        ) => ({ ...acc, [filePath]: files[filePath] }),
+        {},
+      );
+
+    const localPaths = new Set(Object.keys(localFiles));
+    const remotePaths = new Set(Object.keys(remoteFiles));
+    const commonPaths = Array.from(localPaths).filter((filePath: string) =>
+      remotePaths.has(filePath),
+    );
+
+    const conflictPaths = commonPaths.filter(
+      (filePath: string) => localFiles[filePath] !== remoteFiles[filePath].sha,
+    );
+    const samePaths = commonPaths.filter(
+      (filePath: string) => localFiles[filePath] === remoteFiles[filePath].sha,
+    );
+
+    samePaths.forEach((filePath: string) => {
+      const current = this.metadataStore.data.files[filePath];
+      this.metadataStore.data.files[filePath] = {
+        path: filePath,
+        sha: localFiles[filePath],
+        dirty: false,
+        justDownloaded: false,
+        lastModified: current?.lastModified || Date.now(),
+        deleted: false,
+        deletedAt: null,
+      };
+    });
+
+    let conflictResolutions: ConflictResolution[] = [];
+    let conflictActions: SyncAction[] = [];
+
+    if (conflictPaths.length > 0) {
+      const conflicts = await this.loadConflicts(conflictPaths, remoteFiles);
+      await this.logger.warn("Found initial sync conflicts", conflicts);
+
+      if (this.settings.conflictHandling === "ask") {
+        conflictResolutions = await this.onConflicts(conflicts);
+        conflictActions = conflictResolutions.map(
+          (resolution: ConflictResolution) => ({
+            type: "upload",
+            filePath: resolution.filePath,
+          }),
+        );
+      } else if (this.settings.conflictHandling === "overwriteLocal") {
+        conflictActions = conflicts.map((conflict: ConflictFile) => ({
+          type: "download",
+          filePath: conflict.filePath,
+        }));
+      } else if (this.settings.conflictHandling === "overwriteRemote") {
+        conflictActions = conflicts.map((conflict: ConflictFile) => ({
+          type: "upload",
+          filePath: conflict.filePath,
+        }));
+      }
+    }
+
+    const actions: SyncAction[] = [
+      ...Object.keys(remoteFiles)
+        .filter((filePath: string) => !localPaths.has(filePath))
+        .map((filePath: string) => ({
+          type: "download" as const,
+          filePath,
+        })),
+      ...Object.keys(localFiles)
+        .filter((filePath: string) => !remotePaths.has(filePath))
+        .map((filePath: string) => ({
+          type: "upload" as const,
+          filePath,
+        })),
+      ...conflictActions,
+    ];
+
+    const newTreeFiles: { [key: string]: NewTreeRequestItem } = Object.keys(
+      files,
+    )
+      .map((filePath: string) => ({
+        path: files[filePath].path,
+        mode: files[filePath].mode,
+        type: files[filePath].type,
+        sha: files[filePath].sha,
+      }))
+      .reduce(
+        (
+          acc: { [key: string]: NewTreeRequestItem },
+          item: NewTreeRequestItem,
+        ) => ({ ...acc, [item.path]: item }),
+        {},
+      );
+
+    await Promise.all(
+      actions
+        .filter((action) => action.type === "upload")
+        .map(async (action: SyncAction) => {
+          const resolution = conflictResolutions.find(
+            (item: ConflictResolution) => item.filePath === action.filePath,
+          );
+          const content =
+            resolution?.content ||
+            (await this.vault.adapter.read(normalizePath(action.filePath)));
+          newTreeFiles[action.filePath] = {
+            path: action.filePath,
+            mode: "100644",
+            type: "blob",
+            content,
+          };
+        }),
+    );
+
+    await Promise.all(
+      actions
+        .filter((action) => action.type === "download")
+        .map(async (action: SyncAction) => {
+          await this.downloadFile(files[action.filePath], Date.now());
+        }),
+    );
+
+    await this.commitSync(newTreeFiles, treeSha, {
+      actions,
+      conflictResolutions,
+    });
   }
 
   /**
@@ -197,96 +564,109 @@ export default class SyncManager {
   ) {
     await this.logger.info("Starting first sync from remote files");
 
-    // We want to avoid getting throttled by GitHub, so instead of making a request for each
-    // file we download the whole repository as a ZIP file and extract it in the vault.
-    // We exclude config dir files if the user doesn't want to sync those.
-    const zipBuffer = await this.client.downloadRepositoryArchive();
-    const zipBlob = new Blob([zipBuffer]);
-    const reader = new ZipReader(new BlobReader(zipBlob));
-    const entries = await reader.getEntries();
+    const gitCliSync = await this.getGitCliSync();
 
-    await this.logger.info("Extracting files from ZIP", {
-      length: entries.length,
-    });
+    if (gitCliSync !== null) {
+      await this.logger.info("Downloading remote files through git", {
+        length: Object.keys(files).length,
+      });
 
-    await Promise.all(
-      entries.map(async (entry: Entry) => {
-        // All repo ZIPs contain a root directory that contains all the content
-        // of that repo, we need to ignore that directory so we strip the first
-        // folder segment from the path
-        const pathParts = entry.filename.split("/");
-        const targetPath =
-          pathParts.length > 1 ? pathParts.slice(1).join("/") : entry.filename;
+      await Promise.all(
+        Object.keys(files).map(async (targetPath: string) => {
+          const hiddenFileName = targetPath.split("/").last();
+          const shouldSkipHiddenFile =
+            hiddenFileName?.startsWith(".") &&
+            targetPath !== ".gitignore" &&
+            targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
 
-        if (targetPath === "") {
-          // Must be the root folder, skip it.
-          // This is really important as that would lead us to try and
-          // create the folder "/" and crash Obsidian
-          return;
-        }
+          if (!this.shouldSyncPath(targetPath) || shouldSkipHiddenFile) {
+            await this.logger.info("Skipped remote file", { targetPath });
+            return;
+          }
 
-        if (
-          this.settings.syncConfigDir &&
-          targetPath.startsWith(this.vault.configDir) &&
-          targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`
-        ) {
-          await this.logger.info("Skipped config", { targetPath });
-          return;
-        }
+          await this.downloadFile(files[targetPath], Date.now());
+        }),
+      );
 
-        if (entry.directory) {
+      await this.logger.info("Downloaded remote files through git");
+    } else {
+      // We want to avoid getting throttled by GitHub, so instead of making a request for each
+      // file we download the whole repository as a ZIP file and extract it in the vault.
+      // We exclude config dir files if the user doesn't want to sync those.
+      const zipBuffer = await this.client.downloadRepositoryArchive();
+      const zipBlob = new Blob([zipBuffer]);
+      const reader = new ZipReader(new BlobReader(zipBlob));
+      const entries = await reader.getEntries();
+
+      await this.logger.info("Extracting files from ZIP", {
+        length: entries.length,
+      });
+
+      await Promise.all(
+        entries.map(async (entry: Entry) => {
+          // All repo ZIPs contain a root directory that contains all the content
+          // of that repo, we need to ignore that directory so we strip the first
+          // folder segment from the path
+          const pathParts = entry.filename.split("/");
+          const targetPath =
+            pathParts.length > 1 ? pathParts.slice(1).join("/") : entry.filename;
+
+          if (targetPath === "") {
+            // Must be the root folder, skip it.
+            // This is really important as that would lead us to try and
+            // create the folder "/" and crash Obsidian
+            return;
+          }
+
+          if (entry.directory) {
+            return;
+          }
+
+          if (files[targetPath] === undefined) {
+            await this.logger.info("Skipped remote file", { targetPath });
+            return;
+          }
+
+          const hiddenFileName = targetPath.split("/").last();
+          const shouldSkipHiddenFile =
+            hiddenFileName?.startsWith(".") &&
+            targetPath !== ".gitignore" &&
+            targetPath !== `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+          if (!this.shouldSyncPath(targetPath) || shouldSkipHiddenFile) {
+            await this.logger.info("Skipped remote file", { targetPath });
+            return;
+          }
+
+          const writer = new Uint8ArrayWriter();
+          await entry.getData!(writer);
+          const data = await writer.getData();
+          const dir = targetPath.split("/").splice(0, -1).join("/");
+          if (dir !== "") {
+            const normalizedDir = normalizePath(dir);
+            await this.vault.adapter.mkdir(normalizedDir);
+            await this.logger.info("Created directory", {
+              normalizedDir,
+            });
+          }
+
           const normalizedPath = normalizePath(targetPath);
-          await this.vault.adapter.mkdir(normalizedPath);
-          await this.logger.info("Created directory", {
+          await this.vault.adapter.writeBinary(normalizedPath, data);
+          await this.logger.info("Written file", {
             normalizedPath,
           });
-          return;
-        }
+          this.metadataStore.data.files[normalizedPath] = {
+            path: normalizedPath,
+            sha: files[normalizedPath].sha,
+            dirty: false,
+            justDownloaded: true,
+            lastModified: Date.now(),
+          };
+          await this.metadataStore.save();
+        }),
+      );
 
-        if (targetPath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
-          // We don't want to download the log file if the user synced it in the past.
-          // This is necessary because in the past we forgot to ignore the log file
-          // from syncing if the user enabled configs sync.
-          // To avoid downloading it we ignore it if still present in the remote repo.
-          return;
-        }
-
-        if (targetPath.split("/").last()?.startsWith(".")) {
-          // We must skip hidden files as that creates issues with syncing.
-          // This is fine as users can't edit hidden files in Obsidian anyway.
-          await this.logger.info("Skipping hidden file", targetPath);
-          return;
-        }
-
-        const writer = new Uint8ArrayWriter();
-        await entry.getData!(writer);
-        const data = await writer.getData();
-        const dir = targetPath.split("/").splice(0, -1).join("/");
-        if (dir !== "") {
-          const normalizedDir = normalizePath(dir);
-          await this.vault.adapter.mkdir(normalizedDir);
-          await this.logger.info("Created directory", {
-            normalizedDir,
-          });
-        }
-
-        const normalizedPath = normalizePath(targetPath);
-        await this.vault.adapter.writeBinary(normalizedPath, data);
-        await this.logger.info("Written file", {
-          normalizedPath,
-        });
-        this.metadataStore.data.files[normalizedPath] = {
-          path: normalizedPath,
-          sha: files[normalizedPath].sha,
-          dirty: false,
-          justDownloaded: true,
-          lastModified: Date.now(),
-        };
-        await this.metadataStore.save();
-      }),
-    );
-
-    await this.logger.info("Extracted zip");
+      await this.logger.info("Extracted zip");
+    }
 
     const newTreeFiles = Object.keys(files)
       .map((filePath: string) => ({
@@ -425,9 +805,19 @@ export default class SyncManager {
 
   private async syncImpl() {
     await this.logger.info("Starting sync");
-    const { files, sha: treeSha } = await this.client.getRepoContent({
+    await this.refreshSyncPathFilter();
+    await this.pruneUnsyncableMetadata();
+
+    const gitCliSync = await this.getGitCliSync();
+    if (gitCliSync !== null) {
+      await this.syncWithGitCli(gitCliSync);
+      return;
+    }
+
+    const { files: repoFiles, sha: treeSha } = await this.getRepoContent({
       retry: true,
     });
+    const files = await this.filterRemoteRepoFiles(repoFiles);
 
     if (
       Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
@@ -588,6 +978,44 @@ export default class SyncManager {
     });
   }
 
+  private async syncWithGitCli(gitCliSync: GitCliSync) {
+    await this.refreshSyncPathFilter();
+    await this.pruneUnsyncableMetadata();
+
+    const syncMessage = this.buildCommitMessage("Sync");
+    await gitCliSync.syncBranch(syncMessage);
+
+    const { files: headFiles } = await gitCliSync.getHeadRepoContent();
+    const files = await this.filterRemoteRepoFiles(headFiles);
+    if (
+      Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
+    ) {
+      delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
+    }
+
+    const { metadata } = await this.getEffectiveRemoteMetadata(files);
+    metadata.lastSync = Date.now();
+
+    Object.keys(metadata.files).forEach((filePath: string) => {
+      const fileMetadata = metadata.files[filePath];
+      fileMetadata.dirty = false;
+      fileMetadata.justDownloaded = false;
+      if (!fileMetadata.deleted && files[filePath]) {
+        fileMetadata.sha = files[filePath].sha;
+      }
+    });
+
+    const metadataContent = serializeMetadata(metadata);
+    await gitCliSync.updateMetadataAndPush({
+      metadataContent,
+      message: this.buildCommitMessage("Sync metadata"),
+    });
+
+    this.metadataStore.data = metadata;
+    await this.metadataStore.save();
+    await this.logger.info("Git CLI sync done");
+  }
+
   private async getEffectiveRemoteMetadata(files: {
     [key: string]: GetTreeResponseItem;
   }): Promise<{
@@ -606,7 +1034,7 @@ export default class SyncManager {
 
     if (manifest !== undefined) {
       try {
-        const blob = await this.client.getBlob({ sha: manifest.sha, retry: true });
+        const blob = await this.getBlob({ sha: manifest.sha, retry: true });
         remoteMetadata = JSON.parse(decodeBase64String(blob.content));
         if (!remoteMetadata.files) {
           throw new Error("Remote metadata is invalid");
@@ -715,7 +1143,11 @@ export default class SyncManager {
   }
 
   async getSyncStatus(): Promise<SyncStatus> {
-    const { files } = await this.client.getRepoContent({ retry: true });
+    await this.refreshSyncPathFilter();
+    await this.pruneUnsyncableMetadata();
+
+    const { files: repoFiles } = await this.getRepoContent({ retry: true });
+    const files = await this.filterRemoteRepoFiles(repoFiles);
     if (
       Object.keys(files).contains(`${this.vault.configDir}/${LOG_FILE_NAME}`)
     ) {
@@ -755,6 +1187,10 @@ export default class SyncManager {
   }
 
   async getLocalFileSyncState(filePath: string): Promise<string> {
+    if (!this.shouldSyncPath(filePath)) {
+      return "Ignored";
+    }
+
     const fileMetadata = this.metadataStore.data.files[filePath];
     if (!fileMetadata) {
       return "Untracked";
@@ -837,10 +1273,9 @@ export default class SyncManager {
           // Load contents in parallel
           const [remoteContent, localContent] = await Promise.all([
             await (async () => {
-              const res = await this.client.getBlob({
+              const res = await this.getBlob({
                 sha: filesMetadata[filePath].sha!,
                 retry: true,
-                maxRetries: 1,
               });
               return decodeBase64String(res.content);
             })(),
@@ -1093,11 +1528,13 @@ export default class SyncManager {
     // We don't save the metadata file after setting the SHAs cause we do that when
     // the sync is fully commited at the end.
     // TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
-    //
-    // In here we also upload blob is file is a binary. We do it here because when uploading a blob we
-    // also get back its SHA, so we can set it together with other files.
-    // We also do that right before creating the new tree because we need the SHAs of those blob to
-    // correctly create it.
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const commitMessage = this.buildCommitMessage(
+      "Sync",
+      treeFiles,
+      actions,
+      conflictResolutions,
+    );
     await Promise.all(
       Object.keys(treeFiles)
         .filter((filePath: string) => treeFiles[filePath].content)
@@ -1132,7 +1569,6 @@ export default class SyncManager {
     );
 
     // Update manifest in list of new tree items
-    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
     if (!treeFiles[manifestPath]) {
       treeFiles[manifestPath] = {
         path: manifestPath,
@@ -1141,7 +1577,7 @@ export default class SyncManager {
       };
     }
     delete treeFiles[manifestPath].sha;
-    treeFiles[manifestPath].content = JSON.stringify(this.metadataStore.data);
+    treeFiles[manifestPath].content = serializeMetadata(this.metadataStore.data);
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1158,8 +1594,7 @@ export default class SyncManager {
     const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
 
     const commitSha = await this.client.createCommit({
-      // TODO: Make this configurable or find a nicer commit message
-      message: "Sync",
+      message: commitMessage,
       treeSha: newTreeSha,
       parent: branchHeadSha,
     });
@@ -1191,7 +1626,7 @@ export default class SyncManager {
       // File already exists and has the same SHA, no need to download it again.
       return;
     }
-    const blob = await this.client.getBlob({ sha: file.sha, retry: true });
+    const blob = await this.getBlob({ sha: file.sha, retry: true });
     const normalizedPath = normalizePath(file.path);
     const fileFolder = normalizePath(
       normalizedPath.split("/").slice(0, -1).join("/"),
@@ -1223,7 +1658,9 @@ export default class SyncManager {
 
   async loadMetadata() {
     await this.logger.info("Loading metadata");
+    await this.refreshSyncPathFilter();
     await this.metadataStore.load();
+    await this.pruneUnsyncableMetadata();
     if (Object.keys(this.metadataStore.data.files).length === 0) {
       await this.logger.info("Metadata was empty, loading all files");
       let files = [];
@@ -1243,8 +1680,7 @@ export default class SyncManager {
         folders.push(...res.folders);
       }
       files.forEach((filePath: string) => {
-        if (filePath === `${this.vault.configDir}/workspace.json`) {
-          // Obsidian recommends not syncing the workspace file
+        if (!this.shouldSyncPath(filePath, { includeManifest: false })) {
           return;
         }
 
@@ -1268,7 +1704,7 @@ export default class SyncManager {
         justDownloaded: false,
         lastModified: Date.now(),
       };
-      this.metadataStore.save();
+      await this.metadataStore.save();
     }
     await this.logger.info("Loaded metadata");
   }
@@ -1280,6 +1716,7 @@ export default class SyncManager {
    */
   async addConfigDirToMetadata() {
     await this.logger.info("Adding config dir to metadata");
+    await this.refreshSyncPathFilter();
     // Get all the files in the config dir
     let files = [];
     let folders = [this.vault.configDir];
@@ -1294,6 +1731,10 @@ export default class SyncManager {
     }
     // Add them to the metadata store
     files.forEach((filePath: string) => {
+      if (!this.shouldSyncPath(filePath, { includeManifest: false })) {
+        return;
+      }
+
       this.metadataStore.data.files[filePath] = {
         path: filePath,
         sha: null,
@@ -1302,7 +1743,7 @@ export default class SyncManager {
         lastModified: Date.now(),
       };
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   /**
@@ -1314,6 +1755,7 @@ export default class SyncManager {
    */
   async removeConfigDirFromMetadata() {
     await this.logger.info("Removing config dir from metadata");
+    await this.refreshSyncPathFilter();
     // Get all the files in the config dir
     let files = [];
     let folders = [this.vault.configDir];
@@ -1348,6 +1790,10 @@ export default class SyncManager {
     | "pending-deletion"
     | "untracked"
     | null {
+    if (!this.shouldSyncPath(filePath)) {
+      return null;
+    }
+
     if (
       filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}` ||
       filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`

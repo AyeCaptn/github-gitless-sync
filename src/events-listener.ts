@@ -1,8 +1,9 @@
 import { Vault, TAbstractFile, TFolder } from "obsidian";
-import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
+import MetadataStore from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
-import Logger, { LOG_FILE_NAME } from "./logger";
+import Logger from "./logger";
 import GitHubSyncPlugin from "./main";
+import SyncPathFilter from "./sync-path-filter";
 
 /**
  * Tracks changes to local sync directory and updates files metadata.
@@ -13,6 +14,7 @@ export default class EventsListener {
     private metadataStore: MetadataStore,
     private settings: GitHubSyncSettings,
     private logger: Logger,
+    private syncPathFilter: SyncPathFilter,
   ) {}
 
   start(plugin: GitHubSyncPlugin) {
@@ -26,9 +28,11 @@ export default class EventsListener {
   }
 
   private async onCreate(file: TAbstractFile) {
+    await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received create event", file.path);
     if (!this.isSyncable(file.path)) {
       // The file has not been created in directory that we're syncing with GitHub
+      await this.removeFromMetadata(file.path);
       await this.logger.info("Skipped created file", file.path);
       return;
     }
@@ -61,6 +65,7 @@ export default class EventsListener {
 
   private async onDelete(file: TAbstractFile | string) {
     const filePath = file instanceof TAbstractFile ? file.path : file;
+    await this.refreshSyncPathFilterIfNeeded(filePath);
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
       // Skip folders
@@ -68,19 +73,27 @@ export default class EventsListener {
     }
     if (!this.isSyncable(filePath)) {
       // The file was not in directory that we're syncing with GitHub
+      await this.removeFromMetadata(filePath);
       return;
     }
 
-    this.metadataStore.data.files[filePath].deleted = true;
-    this.metadataStore.data.files[filePath].deletedAt = Date.now();
+    const data = this.metadataStore.data.files[filePath];
+    if (!data) {
+      return;
+    }
+
+    data.deleted = true;
+    data.deletedAt = Date.now();
     await this.metadataStore.save();
     await this.logger.info("Updated deleted file", filePath);
   }
 
   private async onModify(file: TAbstractFile) {
+    await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received modify event", file.path);
     if (!this.isSyncable(file.path)) {
       // The file has not been create in directory that we're syncing with GitHub
+      await this.removeFromMetadata(file.path);
       await this.logger.info("Skipped modified file", file.path);
       return;
     }
@@ -100,13 +113,26 @@ export default class EventsListener {
       );
       return;
     }
-    this.metadataStore.data.files[file.path].lastModified = Date.now();
-    this.metadataStore.data.files[file.path].dirty = true;
+
+    if (!data) {
+      this.metadataStore.data.files[file.path] = {
+        path: file.path,
+        sha: null,
+        dirty: true,
+        justDownloaded: false,
+        lastModified: Date.now(),
+      };
+    } else {
+      data.lastModified = Date.now();
+      data.dirty = true;
+    }
+
     await this.metadataStore.save();
     await this.logger.info("Updated modified file", file.path);
   }
 
   private async onRename(file: TAbstractFile, oldPath: string) {
+    await this.refreshSyncPathFilterIfNeeded(file.path, oldPath);
     await this.logger.info("Received rename event", file.path);
     if (file instanceof TFolder) {
       // Skip folders
@@ -114,6 +140,10 @@ export default class EventsListener {
     }
     if (!this.isSyncable(file.path) && !this.isSyncable(oldPath)) {
       // Both are not in directory that we're syncing with GitHub
+      await Promise.all([
+        this.removeFromMetadata(file.path),
+        this.removeFromMetadata(oldPath),
+      ]);
       return;
     }
 
@@ -136,27 +166,38 @@ export default class EventsListener {
   }
 
   private isSyncable(filePath: string) {
-    if (filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`) {
-      // Manifest file must always be synced
-      return true;
-    } else if (
-      filePath === `${this.vault.configDir}/workspace.json` ||
-      filePath === `${this.vault.configDir}/workspace-mobile.json`
-    ) {
-      // Obsidian recommends not syncing the workspace files
-      return false;
-    } else if (filePath === `${this.vault.configDir}/${LOG_FILE_NAME}`) {
-      // Don't sync the log file, doesn't make sense
-      return false;
-    } else if (
-      this.settings.syncConfigDir &&
-      filePath.startsWith(this.vault.configDir)
-    ) {
-      // Sync configs only if the user explicitly wants to
-      return true;
-    } else {
-      // All other files can be synced
-      return true;
+    return this.syncPathFilter.shouldSyncPath(filePath);
+  }
+
+  private async refreshSyncPathFilterIfNeeded(...filePaths: string[]) {
+    if (!filePaths.some((filePath) => this.syncPathFilter.isGitIgnorePath(filePath))) {
+      return;
     }
+
+    await this.syncPathFilter.refresh();
+    await this.pruneIgnoredMetadata();
+  }
+
+  private async pruneIgnoredMetadata() {
+    const { files, removedPaths } = this.syncPathFilter.pruneMetadata(
+      this.metadataStore.data.files,
+    );
+
+    if (removedPaths.length === 0) {
+      return;
+    }
+
+    this.metadataStore.data.files = files;
+    await this.metadataStore.save();
+    await this.logger.info("Pruned ignored files from metadata", removedPaths);
+  }
+
+  private async removeFromMetadata(filePath: string) {
+    if (!this.metadataStore.data.files[filePath]) {
+      return;
+    }
+
+    delete this.metadataStore.data.files[filePath];
+    await this.metadataStore.save();
   }
 }

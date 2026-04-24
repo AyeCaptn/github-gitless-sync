@@ -1,4 +1,4 @@
-import { Vault, normalizePath } from "obsidian";
+import { normalizePath, Vault } from "obsidian";
 
 export const MANIFEST_FILE_NAME = "github-sync-metadata.json" as const;
 
@@ -37,6 +37,27 @@ export interface Metadata {
   files: { [key: string]: FileMetadata };
 }
 
+export function serializeMetadata(metadata: Metadata): string {
+  const sortedFiles = Object.keys(metadata.files)
+    .sort()
+    .reduce(
+      (acc: { [key: string]: FileMetadata }, filePath: string) => ({
+        ...acc,
+        [filePath]: metadata.files[filePath],
+      }),
+      {},
+    );
+
+  return JSON.stringify(
+    {
+      lastSync: metadata.lastSync,
+      files: sortedFiles,
+    },
+    null,
+    2,
+  );
+}
+
 /**
  * Stores files metadata between sesssions.
  * Data is saved as JSON in the .obsidian folder in the current Vault.
@@ -60,6 +81,14 @@ export default class MetadataStore {
     if (fileExists) {
       const content = await this.vault.adapter.read(this.metadataFile);
       this.data = JSON.parse(content);
+
+      const normalizedContent = serializeMetadata(this.data);
+      if (content !== normalizedContent) {
+        this.writeQueue = this.writeQueue.then(async () => {
+          await this.vault.adapter.write(this.metadataFile, normalizedContent);
+        });
+        await this.writeQueue;
+      }
     } else {
       this.data = { lastSync: 0, files: {} };
     }
@@ -70,10 +99,7 @@ export default class MetadataStore {
    */
   async save() {
     this.writeQueue = this.writeQueue.then(async () => {
-      await this.vault.adapter.write(
-        this.metadataFile,
-        JSON.stringify(this.data),
-      );
+      await this.vault.adapter.write(this.metadataFile, serializeMetadata(this.data));
     });
     return this.writeQueue;
   }
