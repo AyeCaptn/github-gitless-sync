@@ -241,6 +241,44 @@ export default class SyncManager {
     }
   }
 
+  private cloneMetadata(metadata: Metadata): Metadata {
+    return JSON.parse(JSON.stringify(metadata));
+  }
+
+  private hasMeaningfulFileStateChanges(
+    previousMetadata: Metadata,
+    nextMetadata: Metadata,
+  ) {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const toComparableFiles = (metadata: Metadata) =>
+      Object.keys(metadata.files)
+        .filter((filePath: string) => filePath !== manifestPath)
+        .sort()
+        .reduce(
+          (
+            acc: {
+              [key: string]: {
+                sha: string | null;
+                deleted: boolean;
+              };
+            },
+            filePath: string,
+          ) => ({
+            ...acc,
+            [filePath]: {
+              sha: metadata.files[filePath].sha,
+              deleted: metadata.files[filePath].deleted === true,
+            },
+          }),
+          {},
+        );
+
+    return (
+      JSON.stringify(toComparableFiles(previousMetadata)) !==
+      JSON.stringify(toComparableFiles(nextMetadata))
+    );
+  }
+
   private async getCurrentLocalFileSHAs() {
     const fileSHAs: { [key: string]: string } = {};
 
@@ -954,6 +992,8 @@ export default class SyncManager {
       }),
     );
 
+    const previousMetadata = this.cloneMetadata(this.metadataStore.data);
+
     // Download files and delete local files
     await Promise.all([
       ...actions
@@ -974,6 +1014,7 @@ export default class SyncManager {
     await this.commitSync(newTreeFiles, treeSha, {
       actions,
       conflictResolutions,
+      previousMetadata,
     });
   }
 
@@ -992,8 +1033,14 @@ export default class SyncManager {
       delete files[`${this.vault.configDir}/${LOG_FILE_NAME}`];
     }
 
+    const previousMetadata = this.cloneMetadata(this.metadataStore.data);
     const { metadata } = await this.getEffectiveRemoteMetadata(files);
-    metadata.lastSync = Date.now();
+    metadata.lastSync = this.hasMeaningfulFileStateChanges(
+      previousMetadata,
+      metadata,
+    )
+      ? Date.now()
+      : previousMetadata.lastSync;
 
     Object.keys(metadata.files).forEach((filePath: string) => {
       const fileMetadata = metadata.files[filePath];
@@ -1464,15 +1511,14 @@ export default class SyncManager {
     {
       actions = [],
       conflictResolutions = [],
+      previousMetadata,
     }: {
       actions?: SyncAction[];
       conflictResolutions?: ConflictResolution[];
+      previousMetadata?: Metadata;
     } = {},
   ) {
-    // Update local sync time
     const syncTime = Date.now();
-    this.metadataStore.data.lastSync = syncTime;
-    this.metadataStore.save();
 
     actions.forEach((action) => {
       switch (action.type) {
@@ -1566,6 +1612,14 @@ export default class SyncManager {
           this.metadataStore.data.files[filePath].sha = sha;
         }),
     );
+
+    if (
+      previousMetadata === undefined ||
+      this.hasMeaningfulFileStateChanges(previousMetadata, this.metadataStore.data)
+    ) {
+      this.metadataStore.data.lastSync = syncTime;
+      this.metadataStore.save();
+    }
 
     // Update manifest in list of new tree items
     if (!treeFiles[manifestPath]) {
