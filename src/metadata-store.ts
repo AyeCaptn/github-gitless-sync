@@ -93,6 +93,16 @@ export default class MetadataStore {
     );
   }
 
+  private enqueueWrite(content: string) {
+    const write = this.writeQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await this.vault.adapter.write(this.metadataFile, content);
+      });
+    this.writeQueue = write;
+    return write;
+  }
+
   /**
    * Loads the metadata from disk.
    */
@@ -104,10 +114,7 @@ export default class MetadataStore {
 
       const normalizedContent = serializeMetadata(this.data);
       if (content !== normalizedContent) {
-        this.writeQueue = this.writeQueue.then(async () => {
-          await this.vault.adapter.write(this.metadataFile, normalizedContent);
-        });
-        await this.writeQueue;
+        await this.enqueueWrite(normalizedContent);
       }
     } else {
       this.data = { lastSync: 0, files: {} };
@@ -118,10 +125,7 @@ export default class MetadataStore {
    * Save current metadata to disk.
    */
   async save() {
-    this.writeQueue = this.writeQueue.then(async () => {
-      await this.vault.adapter.write(this.metadataFile, serializeMetadata(this.data));
-    });
-    return this.writeQueue;
+    return this.enqueueWrite(serializeMetadata(this.data));
   }
 
   reset() {

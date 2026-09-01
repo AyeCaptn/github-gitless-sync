@@ -200,6 +200,10 @@ export default class GitHubSyncPlugin extends Plugin {
       if (this.settings.showFileExplorerBadges) {
         this.showFileExplorerBadges();
       }
+
+      if (this.settings.syncOnStartup) {
+        void this.sync();
+      }
     });
 
     this.registerEvent(

@@ -130,6 +130,41 @@ export default class SyncManager {
     return await this.client.getBlob({ sha, retry });
   }
 
+  private async getStableRepoContent(): Promise<
+    RepoContent & { branchHeadSha: string }
+  > {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
+      const content = await this.client.getRepoContent({ retry: true });
+      const confirmedBranchHeadSha = await this.client.getBranchHeadSha({
+        retry: true,
+      });
+
+      if (branchHeadSha === confirmedBranchHeadSha) {
+        return { ...content, branchHeadSha };
+      }
+
+      await this.logger.warn(
+        "Remote branch changed while loading repository, retrying",
+      );
+    }
+
+    throw new Error(
+      "Remote branch kept changing while preparing sync. Please sync again.",
+    );
+  }
+
+  private async assertBranchHead(expectedBranchHeadSha: string) {
+    const currentBranchHeadSha = await this.client.getBranchHeadSha({
+      retry: true,
+    });
+    if (currentBranchHeadSha !== expectedBranchHeadSha) {
+      throw new Error(
+        "Remote branch changed during sync. Please sync again to reconcile the latest changes.",
+      );
+    }
+  }
+
   private getRemoteChangedPaths(
     treeFiles: { [key: string]: NewTreeRequestItem },
     actions: SyncAction[] = [],
@@ -279,6 +314,44 @@ export default class SyncManager {
     );
   }
 
+  private async reconcileMatchingLocalFiles(remoteMetadata: Metadata) {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    let changed = false;
+
+    await Promise.all(
+      Object.keys(this.metadataStore.data.files).map(async (filePath: string) => {
+        const localFile = this.metadataStore.data.files[filePath];
+        const remoteFile = remoteMetadata.files[filePath];
+        if (
+          filePath === manifestPath ||
+          remoteFile === undefined ||
+          remoteFile.deleted ||
+          localFile.deleted
+        ) {
+          return;
+        }
+
+        const localSha = await this.calculateSHA(filePath);
+        if (
+          localSha === remoteFile.sha &&
+          (localFile.sha !== remoteFile.sha || localFile.dirty)
+        ) {
+          localFile.sha = remoteFile.sha;
+          localFile.dirty = false;
+          localFile.justDownloaded = false;
+          changed = true;
+        }
+      }),
+    );
+
+    if (changed) {
+      await this.metadataStore.save();
+      await this.logger.info(
+        "Recovered local metadata from confirmed remote files",
+      );
+    }
+  }
+
   private async getCurrentLocalFileSHAs() {
     const fileSHAs: { [key: string]: string } = {};
 
@@ -330,9 +403,9 @@ export default class SyncManager {
       this.vault.getRoot().path,
     );
     // There are files or folders in the vault dir
+    // The config dir is always present, so it does not make the vault non-empty.
     return (
-      files.length === 0 ||
-      // We filter out the config dir since is always present so it's fine if we find it.
+      files.length === 0 &&
       folders.filter((f) => f !== this.vault.configDir).length === 0
     );
   }
@@ -374,10 +447,13 @@ export default class SyncManager {
       [key: string]: GetTreeResponseItem;
     } = {};
     let treeSha: string = "";
+    let branchHeadSha: string | undefined;
     try {
-      res = await this.getRepoContent();
+      const stableContent = await this.getStableRepoContent();
+      res = stableContent;
       files = await this.filterRemoteRepoFiles(res.files);
       treeSha = res.sha;
+      branchHeadSha = stableContent.branchHeadSha;
     } catch (err) {
       // 409 is returned in case the remote repo has been just created
       // and contains no files.
@@ -409,9 +485,11 @@ export default class SyncManager {
       });
       // Now get the repo content again cause we know for sure it will return a
       // valid sha that we can use to create the first sync commit.
-      res = await this.getRepoContent({ retry: true });
+      const stableContent = await this.getStableRepoContent();
+      res = stableContent;
       files = await this.filterRemoteRepoFiles(res.files);
       treeSha = res.sha;
+      branchHeadSha = stableContent.branchHeadSha;
     }
 
     const vaultIsEmpty = await this.vaultIsEmpty();
@@ -424,18 +502,18 @@ export default class SyncManager {
         "Both remote and local already have files. Reconciling them for the first sync...",
         7000,
       );
-      await this.firstSyncFromBoth(files, treeSha);
+      await this.firstSyncFromBoth(files, treeSha, branchHeadSha);
     } else if (repositoryIsEmpty) {
       // Remote has no files and no manifest, let's just upload whatever we have locally.
       // This is fine even if the vault is empty.
       // The most important thing at this point is that the remote manifest is created.
-      await this.firstSyncFromLocal(files, treeSha);
+      await this.firstSyncFromLocal(files, treeSha, branchHeadSha);
     } else {
       // Local has no files and there's no manifest in the remote repo.
       // Let's download whatever we have in the remote repo.
       // This is fine even if the remote repo is empty.
       // In this case too the important step is that the remote manifest is created.
-      await this.firstSyncFromRemote(files, treeSha);
+      await this.firstSyncFromRemote(files, treeSha, branchHeadSha);
     }
   }
 
@@ -447,6 +525,7 @@ export default class SyncManager {
   private async firstSyncFromBoth(
     files: { [key: string]: GetTreeResponseItem },
     treeSha: string,
+    expectedBranchHeadSha?: string,
   ) {
     await this.logger.info("Starting first sync from both local and remote files");
 
@@ -497,10 +576,9 @@ export default class SyncManager {
     let conflictActions: SyncAction[] = [];
 
     if (conflictPaths.length > 0) {
-      const conflicts = await this.loadConflicts(conflictPaths, remoteFiles);
-      await this.logger.warn("Found initial sync conflicts", conflicts);
-
       if (this.settings.conflictHandling === "ask") {
+        const conflicts = await this.loadConflicts(conflictPaths, remoteFiles);
+        await this.logger.warn("Found initial sync conflicts", conflicts);
         conflictResolutions = await this.onConflicts(conflicts);
         conflictActions = conflictResolutions.map(
           (resolution: ConflictResolution) => ({
@@ -509,14 +587,14 @@ export default class SyncManager {
           }),
         );
       } else if (this.settings.conflictHandling === "overwriteLocal") {
-        conflictActions = conflicts.map((conflict: ConflictFile) => ({
+        conflictActions = conflictPaths.map((filePath: string) => ({
           type: "download",
-          filePath: conflict.filePath,
+          filePath,
         }));
       } else if (this.settings.conflictHandling === "overwriteRemote") {
-        conflictActions = conflicts.map((conflict: ConflictFile) => ({
+        conflictActions = conflictPaths.map((filePath: string) => ({
           type: "upload",
-          filePath: conflict.filePath,
+          filePath,
         }));
       }
     }
@@ -537,22 +615,7 @@ export default class SyncManager {
       ...conflictActions,
     ];
 
-    const newTreeFiles: { [key: string]: NewTreeRequestItem } = Object.keys(
-      files,
-    )
-      .map((filePath: string) => ({
-        path: files[filePath].path,
-        mode: files[filePath].mode,
-        type: files[filePath].type,
-        sha: files[filePath].sha,
-      }))
-      .reduce(
-        (
-          acc: { [key: string]: NewTreeRequestItem },
-          item: NewTreeRequestItem,
-        ) => ({ ...acc, [item.path]: item }),
-        {},
-      );
+    const newTreeFiles: { [key: string]: NewTreeRequestItem } = {};
 
     await Promise.all(
       actions
@@ -561,9 +624,12 @@ export default class SyncManager {
           const resolution = conflictResolutions.find(
             (item: ConflictResolution) => item.filePath === action.filePath,
           );
+          const normalizedPath = normalizePath(action.filePath);
           const content =
-            resolution?.content ||
-            (await this.vault.adapter.read(normalizePath(action.filePath)));
+            resolution?.content ??
+            (hasTextExtension(normalizedPath)
+              ? await this.vault.adapter.read(normalizedPath)
+              : "binaryfile");
           newTreeFiles[action.filePath] = {
             path: action.filePath,
             mode: "100644",
@@ -584,6 +650,7 @@ export default class SyncManager {
     await this.commitSync(newTreeFiles, treeSha, {
       actions,
       conflictResolutions,
+      expectedBranchHeadSha,
     });
   }
 
@@ -598,6 +665,7 @@ export default class SyncManager {
   private async firstSyncFromRemote(
     files: { [key: string]: GetTreeResponseItem },
     treeSha: string,
+    expectedBranchHeadSha?: string,
   ) {
     await this.logger.info("Starting first sync from remote files");
 
@@ -705,20 +773,7 @@ export default class SyncManager {
       await this.logger.info("Extracted zip");
     }
 
-    const newTreeFiles = Object.keys(files)
-      .map((filePath: string) => ({
-        path: files[filePath].path,
-        mode: files[filePath].mode,
-        type: files[filePath].type,
-        sha: files[filePath].sha,
-      }))
-      .reduce(
-        (
-          acc: { [key: string]: NewTreeRequestItem },
-          item: NewTreeRequestItem,
-        ) => ({ ...acc, [item.path]: item }),
-        {},
-      );
+    const newTreeFiles: { [key: string]: NewTreeRequestItem } = {};
     // Add files that are in the manifest but not in the tree.
     await Promise.all(
       Object.keys(this.metadataStore.data.files)
@@ -749,7 +804,7 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    await this.commitSync(newTreeFiles, treeSha, { expectedBranchHeadSha });
   }
 
   /**
@@ -763,22 +818,10 @@ export default class SyncManager {
   private async firstSyncFromLocal(
     files: { [key: string]: GetTreeResponseItem },
     treeSha: string,
+    expectedBranchHeadSha?: string,
   ) {
     await this.logger.info("Starting first sync from local files");
-    const newTreeFiles = Object.keys(files)
-      .map((filePath: string) => ({
-        path: files[filePath].path,
-        mode: files[filePath].mode,
-        type: files[filePath].type,
-        sha: files[filePath].sha,
-      }))
-      .reduce(
-        (
-          acc: { [key: string]: NewTreeRequestItem },
-          item: NewTreeRequestItem,
-        ) => ({ ...acc, [item.path]: item }),
-        {},
-      );
+    const newTreeFiles: { [key: string]: NewTreeRequestItem } = {};
     await Promise.all(
       Object.keys(this.metadataStore.data.files)
         .filter((filePath: string) => {
@@ -811,7 +854,7 @@ export default class SyncManager {
           };
         }),
     );
-    await this.commitSync(newTreeFiles, treeSha);
+    await this.commitSync(newTreeFiles, treeSha, { expectedBranchHeadSha });
   }
 
   /**
@@ -851,9 +894,11 @@ export default class SyncManager {
       return;
     }
 
-    const { files: repoFiles, sha: treeSha } = await this.getRepoContent({
-      retry: true,
-    });
+    const {
+      files: repoFiles,
+      sha: treeSha,
+      branchHeadSha,
+    } = await this.getStableRepoContent();
     const files = await this.filterRemoteRepoFiles(repoFiles);
 
     if (
@@ -868,6 +913,8 @@ export default class SyncManager {
 
     const { metadata: remoteMetadata, metadataNeedsUpdate, remoteDriftFiles } =
       await this.getEffectiveRemoteMetadata(files);
+
+    await this.reconcileMatchingLocalFiles(remoteMetadata);
 
     if (metadataNeedsUpdate) {
       await this.logger.warn(
@@ -941,22 +988,8 @@ export default class SyncManager {
     }
     await this.logger.info("Actions to sync", actions);
 
-    const newTreeFiles: { [key: string]: NewTreeRequestItem } = Object.keys(
-      files,
-    )
-      .map((filePath: string) => ({
-        path: files[filePath].path,
-        mode: files[filePath].mode,
-        type: files[filePath].type,
-        sha: files[filePath].sha,
-      }))
-      .reduce(
-        (
-          acc: { [key: string]: NewTreeRequestItem },
-          item: NewTreeRequestItem,
-        ) => ({ ...acc, [item.path]: item }),
-        {},
-      );
+    // base_tree already supplies unchanged files, so only send the delta.
+    const newTreeFiles: { [key: string]: NewTreeRequestItem } = {};
 
     await Promise.all(
       actions.map(async (action) => {
@@ -970,8 +1003,10 @@ export default class SyncManager {
             // conflict resolution instead of reading it from file since at this point
             // we still have not updated the local file.
             const content =
-              resolution?.content ||
-              (await this.vault.adapter.read(normalizedPath));
+              resolution?.content ??
+              (hasTextExtension(normalizedPath)
+                ? await this.vault.adapter.read(normalizedPath)
+                : "binaryfile");
             newTreeFiles[action.filePath] = {
               path: action.filePath,
               mode: "100644",
@@ -981,7 +1016,18 @@ export default class SyncManager {
             break;
           }
           case "delete_remote": {
-            newTreeFiles[action.filePath].sha = null;
+            const remoteFile = files[action.filePath];
+            if (remoteFile === undefined) {
+              throw new Error(
+                `Cannot delete missing remote file ${action.filePath}`,
+              );
+            }
+            newTreeFiles[action.filePath] = {
+              path: action.filePath,
+              mode: remoteFile.mode,
+              type: remoteFile.type,
+              sha: null,
+            };
             break;
           }
           case "download":
@@ -993,6 +1039,8 @@ export default class SyncManager {
     );
 
     const previousMetadata = this.cloneMetadata(this.metadataStore.data);
+
+    await this.assertBranchHead(branchHeadSha);
 
     // Download files and delete local files
     await Promise.all([
@@ -1015,6 +1063,7 @@ export default class SyncManager {
       actions,
       conflictResolutions,
       previousMetadata,
+      expectedBranchHeadSha: branchHeadSha,
     });
   }
 
@@ -1312,9 +1361,19 @@ export default class SyncManager {
       }),
     );
 
+    const conflictPaths = conflicts.filter(
+      (filePath): filePath is string => filePath !== null,
+    );
+    if (this.settings.conflictHandling !== "ask") {
+      return conflictPaths.map((filePath: string) => ({
+        filePath,
+        remoteContent: "",
+        localContent: "",
+      }));
+    }
+
     return await Promise.all(
-      conflicts
-        .filter((filePath): filePath is string => filePath !== null)
+      conflictPaths
         .map(async (filePath: string) => {
           // Load contents in parallel
           const [remoteContent, localContent] = await Promise.all([
@@ -1512,19 +1571,23 @@ export default class SyncManager {
       actions = [],
       conflictResolutions = [],
       previousMetadata,
+      expectedBranchHeadSha,
     }: {
       actions?: SyncAction[];
       conflictResolutions?: ConflictResolution[];
       previousMetadata?: Metadata;
+      expectedBranchHeadSha?: string;
     } = {},
   ) {
     const syncTime = Date.now();
+    const metadataAtCommitStart = this.cloneMetadata(this.metadataStore.data);
+    const nextMetadata = this.cloneMetadata(metadataAtCommitStart);
 
     actions.forEach((action) => {
       switch (action.type) {
         case "upload": {
-          const current = this.metadataStore.data.files[action.filePath];
-          this.metadataStore.data.files[action.filePath] = {
+          const current = nextMetadata.files[action.filePath];
+          nextMetadata.files[action.filePath] = {
             path: action.filePath,
             sha: current?.sha || null,
             dirty: false,
@@ -1536,8 +1599,8 @@ export default class SyncManager {
           break;
         }
         case "delete_remote": {
-          const current = this.metadataStore.data.files[action.filePath];
-          this.metadataStore.data.files[action.filePath] = {
+          const current = nextMetadata.files[action.filePath];
+          nextMetadata.files[action.filePath] = {
             path: action.filePath,
             sha: current?.sha || null,
             dirty: false,
@@ -1563,16 +1626,13 @@ export default class SyncManager {
     // just before pushing to remote.
     // We're going to update the local content when the sync is successful.
     conflictResolutions.forEach((resolution) => {
-      this.metadataStore.data.files[resolution.filePath].lastModified =
-        syncTime;
+      nextMetadata.files[resolution.filePath].lastModified = syncTime;
     });
 
     // We want the remote metadata file to track the correct SHA for each file blob,
     // so just before we upload any file we update all their SHAs in the metadata file.
     // This also makes it easier to handle conflicts.
-    // We don't save the metadata file after setting the SHAs cause we do that when
-    // the sync is fully commited at the end.
-    // TODO: Understand whether it's a problem we don't revert the SHA setting in case of sync failure
+    // Keep these changes staged until the remote branch update succeeds.
     const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
     const commitMessage = this.buildCommitMessage(
       "Sync",
@@ -1582,7 +1642,7 @@ export default class SyncManager {
     );
     await Promise.all(
       Object.keys(treeFiles)
-        .filter((filePath: string) => treeFiles[filePath].content)
+        .filter((filePath: string) => treeFiles[filePath].content !== undefined)
         .map(async (filePath: string) => {
           // I don't fully trust file extensions as they're not completely reliable
           // to determine the file type, though I feel it's ok to compromise and rely
@@ -1592,7 +1652,7 @@ export default class SyncManager {
               treeFiles[filePath].content as string,
             );
             const sha = await this.calculateBlobSHA(contentBytes);
-            this.metadataStore.data.files[filePath].sha = sha;
+            nextMetadata.files[filePath].sha = sha;
             return;
           }
 
@@ -1609,16 +1669,15 @@ export default class SyncManager {
           treeFiles[filePath].sha = sha;
           // Can't have both sha and content set, so we delete it
           delete treeFiles[filePath].content;
-          this.metadataStore.data.files[filePath].sha = sha;
+          nextMetadata.files[filePath].sha = sha;
         }),
     );
 
     if (
       previousMetadata === undefined ||
-      this.hasMeaningfulFileStateChanges(previousMetadata, this.metadataStore.data)
+      this.hasMeaningfulFileStateChanges(previousMetadata, nextMetadata)
     ) {
-      this.metadataStore.data.lastSync = syncTime;
-      this.metadataStore.save();
+      nextMetadata.lastSync = syncTime;
     }
 
     // Update manifest in list of new tree items
@@ -1630,7 +1689,14 @@ export default class SyncManager {
       };
     }
     delete treeFiles[manifestPath].sha;
-    treeFiles[manifestPath].content = serializeMetadata(this.metadataStore.data);
+    treeFiles[manifestPath].content = serializeMetadata(nextMetadata);
+
+    const branchHeadSha =
+      expectedBranchHeadSha ??
+      (await this.client.getBranchHeadSha({ retry: true }));
+    if (expectedBranchHeadSha !== undefined) {
+      await this.assertBranchHead(expectedBranchHeadSha);
+    }
 
     // Create the new tree
     const newTree: { tree: NewTreeRequestItem[]; base_tree: string } = {
@@ -1644,15 +1710,70 @@ export default class SyncManager {
       retry: true,
     });
 
-    const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
-
     const commitSha = await this.client.createCommit({
       message: commitMessage,
       treeSha: newTreeSha,
       parent: branchHeadSha,
+      retry: true,
     });
 
     await this.client.updateBranchHead({ sha: commitSha, retry: true });
+
+    const uploadedPaths = new Set(
+      actions
+        .filter((action) => action.type === "upload")
+        .map((action) => action.filePath),
+    );
+    const uploadedLocalShas = new Map(
+      await Promise.all(
+        Array.from(uploadedPaths).map(async (filePath: string) => [
+          filePath,
+          await this.calculateSHA(filePath),
+        ] as const),
+      ),
+    );
+    const liveMetadata = this.metadataStore.data;
+    const pathsDuringCommit = new Set([
+      ...Object.keys(metadataAtCommitStart.files),
+      ...Object.keys(liveMetadata.files),
+    ]);
+    pathsDuringCommit.forEach((filePath: string) => {
+      const before = metadataAtCommitStart.files[filePath];
+      const current = liveMetadata.files[filePath];
+      if (JSON.stringify(before) === JSON.stringify(current)) {
+        return;
+      }
+
+      if (current === undefined) {
+        delete nextMetadata.files[filePath];
+        return;
+      }
+
+      const committed = nextMetadata.files[filePath];
+      nextMetadata.files[filePath] = { ...current };
+      if (uploadedPaths.has(filePath) && committed !== undefined) {
+        nextMetadata.files[filePath].sha = committed.sha;
+        nextMetadata.files[filePath].dirty = true;
+      }
+    });
+
+    uploadedLocalShas.forEach((localSha, filePath: string) => {
+      const metadata = nextMetadata.files[filePath];
+      if (metadata === undefined) {
+        return;
+      }
+
+      if (localSha === null) {
+        metadata.deleted = true;
+        metadata.deletedAt =
+          liveMetadata.files[filePath]?.deletedAt ?? Date.now();
+        metadata.dirty = true;
+      } else if (localSha !== metadata.sha) {
+        metadata.dirty = true;
+      }
+    });
+
+    this.metadataStore.data = nextMetadata;
 
     // Update the local content of all files that had conflicts we resolved
     await Promise.all(
@@ -1706,7 +1827,7 @@ export default class SyncManager {
     await this.vault.adapter.remove(normalizedPath);
     this.metadataStore.data.files[filePath].deleted = true;
     this.metadataStore.data.files[filePath].deletedAt = Date.now();
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   async loadMetadata() {
@@ -1830,7 +1951,7 @@ export default class SyncManager {
       }
       delete this.metadataStore.data.files[filePath];
     });
-    this.metadataStore.save();
+    await this.metadataStore.save();
   }
 
   getFileMetadata(filePath: string): FileMetadata {

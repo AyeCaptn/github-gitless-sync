@@ -1,7 +1,11 @@
 import { requestUrl, RequestUrlResponse } from "obsidian";
 import Logger from "src/logger";
 import { GitHubSyncSettings } from "src/settings/settings";
-import { retryUntil } from "src/utils";
+import {
+  getHttpRetryDelay,
+  isTransientHttpResponse,
+  retryUntil,
+} from "src/retry";
 
 export type RepoContent = {
   files: { [key: string]: GetTreeResponseItem };
@@ -100,6 +104,20 @@ export default class GithubClient {
     return `status ${response.status}`;
   }
 
+  private retryComplete(
+    response: RequestUrlResponse,
+    { retryUnprocessable = false } = {},
+  ) {
+    return (
+      !isTransientHttpResponse(response) &&
+      !(retryUnprocessable && response.status === 422)
+    );
+  }
+
+  private retryDelay(response: RequestUrlResponse, fallbackDelay: number) {
+    return getHttpRetryDelay(response, fallbackDelay);
+  }
+
   private async throwApiError(
     context: string,
     response: RequestUrlResponse,
@@ -136,8 +154,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422, // Retry condition: only retry on 422 status
+      (res) => this.retryComplete(res, { retryUnprocessable: true }),
       retry ? maxRetries : 0, // Use 0 retries if retry is false
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -183,8 +204,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -230,8 +254,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -256,8 +283,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -297,8 +327,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -339,8 +372,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -376,8 +412,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -422,8 +461,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
@@ -451,8 +493,11 @@ export default class GithubClient {
           throw: false,
         });
       },
-      (res) => res.status !== 422,
+      (res) => this.retryComplete(res),
       retry ? maxRetries : 0,
+      1000,
+      2,
+      this.retryDelay,
     );
 
     if (response.status < 200 || response.status >= 400) {
