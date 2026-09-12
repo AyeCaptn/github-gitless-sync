@@ -234,6 +234,10 @@ export default class GitCliSync {
       return;
     }
 
+    // The manifest is generated from in-memory state after reconciliation. Never
+    // let a pending manifest write block checkout or merge operations.
+    await this.excludeManifestFromSyncCommit();
+
     if (localHead === null && remoteHead !== null) {
       await this.runGit([
         "checkout",

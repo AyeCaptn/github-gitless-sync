@@ -1,5 +1,5 @@
 import { Vault, TAbstractFile, TFolder } from "obsidian";
-import MetadataStore from "./metadata-store";
+import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger from "./logger";
 import GitHubSyncPlugin from "./main";
@@ -28,6 +28,8 @@ export default class EventsListener {
   }
 
   private async onCreate(file: TAbstractFile) {
+    if (this.isMetadataFile(file.path)) return;
+
     await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received create event", file.path);
     if (!this.isSyncable(file.path)) {
@@ -65,6 +67,8 @@ export default class EventsListener {
 
   private async onDelete(file: TAbstractFile | string) {
     const filePath = file instanceof TAbstractFile ? file.path : file;
+    if (this.isMetadataFile(filePath)) return;
+
     await this.refreshSyncPathFilterIfNeeded(filePath);
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
@@ -89,6 +93,8 @@ export default class EventsListener {
   }
 
   private async onModify(file: TAbstractFile) {
+    if (this.isMetadataFile(file.path)) return;
+
     await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received modify event", file.path);
     if (!this.isSyncable(file.path)) {
@@ -132,6 +138,8 @@ export default class EventsListener {
   }
 
   private async onRename(file: TAbstractFile, oldPath: string) {
+    if (this.isMetadataFile(file.path) || this.isMetadataFile(oldPath)) return;
+
     await this.refreshSyncPathFilterIfNeeded(file.path, oldPath);
     await this.logger.info("Received rename event", file.path);
     if (file instanceof TFolder) {
@@ -167,6 +175,10 @@ export default class EventsListener {
 
   private isSyncable(filePath: string) {
     return this.syncPathFilter.shouldSyncPath(filePath);
+  }
+
+  private isMetadataFile(filePath: string) {
+    return filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
   }
 
   private async refreshSyncPathFilterIfNeeded(...filePaths: string[]) {

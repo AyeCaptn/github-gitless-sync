@@ -425,6 +425,7 @@ export default class SyncManager {
       await this.firstSyncImpl();
     } catch (err) {
       this.syncing = false;
+      await this.logger.error("First sync failed", String(err));
       throw err;
     }
     this.syncing = false;
@@ -875,6 +876,7 @@ export default class SyncManager {
       // Shown only if sync doesn't fail
       new Notice("Sync successful", 5000);
     } catch (err) {
+      await this.logger.error("Sync failed", String(err));
       // Show the error to the user, it's not automatically dismissed to make sure
       // the user sees it.
       new Notice(`Error syncing. ${err}`);
