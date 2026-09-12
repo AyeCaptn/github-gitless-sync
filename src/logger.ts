@@ -25,7 +25,7 @@ export default class Logger {
     message: string,
     data?: any,
   ): Promise<void> {
-    if (!this.enabled) return;
+    if (!this.enabled && level !== "ERROR") return;
 
     const logEntry = {
       timestamp: new Date().toISOString(),

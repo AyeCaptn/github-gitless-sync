@@ -1,5 +1,5 @@
 import { Vault, TAbstractFile, TFolder } from "obsidian";
-import MetadataStore, { MANIFEST_FILE_NAME } from "./metadata-store";
+import MetadataStore from "./metadata-store";
 import { GitHubSyncSettings } from "./settings/settings";
 import Logger from "./logger";
 import GitHubSyncPlugin from "./main";
@@ -9,9 +9,6 @@ import SyncPathFilter from "./sync-path-filter";
  * Tracks changes to local sync directory and updates files metadata.
  */
 export default class EventsListener {
-  private paused = false;
-  private pendingEvents = new Set<Promise<void>>();
-
   constructor(
     private vault: Vault,
     private metadataStore: MetadataStore,
@@ -24,53 +21,13 @@ export default class EventsListener {
     // We need to register all the events we subscribe to so they can
     // be correctly detached when the plugin is unloaded too.
     // If we don't they might be left hanging and cause issues.
-    plugin.registerEvent(
-      this.vault.on("create", (file) =>
-        this.trackEvent(() => this.onCreate(file)),
-      ),
-    );
-    plugin.registerEvent(
-      this.vault.on("delete", (file) =>
-        this.trackEvent(() => this.onDelete(file)),
-      ),
-    );
-    plugin.registerEvent(
-      this.vault.on("modify", (file) =>
-        this.trackEvent(() => this.onModify(file)),
-      ),
-    );
-    plugin.registerEvent(
-      this.vault.on("rename", (file, oldPath) =>
-        this.trackEvent(() => this.onRename(file, oldPath)),
-      ),
-    );
-  }
-
-  async pause() {
-    this.paused = true;
-    await Promise.all(
-      Array.from(this.pendingEvents).map((event) =>
-        event.catch(() => undefined),
-      ),
-    );
-  }
-
-  resume() {
-    this.paused = false;
-  }
-
-  private trackEvent(callback: () => Promise<void>) {
-    if (this.paused) return;
-
-    let event: Promise<void>;
-    event = callback().finally(() => this.pendingEvents.delete(event));
-    this.pendingEvents.add(event);
-    return event;
+    plugin.registerEvent(this.vault.on("create", this.onCreate.bind(this)));
+    plugin.registerEvent(this.vault.on("delete", this.onDelete.bind(this)));
+    plugin.registerEvent(this.vault.on("modify", this.onModify.bind(this)));
+    plugin.registerEvent(this.vault.on("rename", this.onRename.bind(this)));
   }
 
   private async onCreate(file: TAbstractFile) {
-    if (this.isMetadataFile(file.path)) return;
-
     await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received create event", file.path);
     if (!this.isSyncable(file.path)) {
@@ -108,8 +65,6 @@ export default class EventsListener {
 
   private async onDelete(file: TAbstractFile | string) {
     const filePath = file instanceof TAbstractFile ? file.path : file;
-    if (this.isMetadataFile(filePath)) return;
-
     await this.refreshSyncPathFilterIfNeeded(filePath);
     await this.logger.info("Received delete event", filePath);
     if (file instanceof TFolder) {
@@ -134,8 +89,6 @@ export default class EventsListener {
   }
 
   private async onModify(file: TAbstractFile) {
-    if (this.isMetadataFile(file.path)) return;
-
     await this.refreshSyncPathFilterIfNeeded(file.path);
     await this.logger.info("Received modify event", file.path);
     if (!this.isSyncable(file.path)) {
@@ -179,8 +132,6 @@ export default class EventsListener {
   }
 
   private async onRename(file: TAbstractFile, oldPath: string) {
-    if (this.isMetadataFile(file.path) || this.isMetadataFile(oldPath)) return;
-
     await this.refreshSyncPathFilterIfNeeded(file.path, oldPath);
     await this.logger.info("Received rename event", file.path);
     if (file instanceof TFolder) {
@@ -216,10 +167,6 @@ export default class EventsListener {
 
   private isSyncable(filePath: string) {
     return this.syncPathFilter.shouldSyncPath(filePath);
-  }
-
-  private isMetadataFile(filePath: string) {
-    return filePath === `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
   }
 
   private async refreshSyncPathFilterIfNeeded(...filePaths: string[]) {

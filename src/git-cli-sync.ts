@@ -23,6 +23,18 @@ type GitCommandOptions = {
   indexFile?: string;
 };
 
+export function getGitErrorMessage(
+  stderr: Buffer | string,
+  stdout: Buffer | string,
+  exitCode?: number | string | null,
+) {
+  const stderrText = Buffer.isBuffer(stderr) ? stderr.toString("utf8") : stderr;
+  const stdoutText = Buffer.isBuffer(stdout) ? stdout.toString("utf8") : stdout;
+  return (
+    stderrText || stdoutText || `Git exited with code ${exitCode ?? "unknown"}`
+  ).trim();
+}
+
 function getNodeRequire(): NodeRequireFunction | null {
   try {
     return Function(
@@ -234,10 +246,6 @@ export default class GitCliSync {
       return;
     }
 
-    // The manifest is generated from in-memory state after reconciliation. Never
-    // let a pending manifest write block checkout or merge operations.
-    await this.excludeManifestFromSyncCommit();
-
     if (localHead === null && remoteHead !== null) {
       await this.runGit([
         "checkout",
@@ -256,26 +264,19 @@ export default class GitCliSync {
         try {
           await this.runGit(["merge", "--no-edit", this.remoteTrackingRef()], false);
         } catch (mergeErr) {
-          const mergeHead = await this.getOptionalRefSha("MERGE_HEAD");
-          if (mergeHead === null) {
-            throw mergeErr;
-          }
-
-          const manifestPath = this.repoPath(
-            `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
-          );
-          if (await this.isPathConflicted(manifestPath)) {
+          const conflictedPaths = await this.getConflictedPaths();
+          if (this.onlyManifestIsConflicted(conflictedPaths)) {
             await this.runGit([
               "checkout",
               "--theirs",
               "--",
-              manifestPath,
+              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
             ]);
-            await this.runGit(["add", "--", manifestPath]);
-          }
-
-          const conflictedPaths = await this.getConflictedPaths();
-          if (conflictedPaths.length === 0) {
+            await this.runGit([
+              "add",
+              "--",
+              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
+            ]);
             await this.runGit([
               "-c",
               "user.name=GitHub Gitless Sync",
@@ -560,9 +561,11 @@ export default class GitCliSync {
       .filter((filePath) => filePath !== "");
   }
 
-  private async isPathConflicted(filePath: string) {
-    const output = await this.runGitText(["ls-files", "-u", "--", filePath]);
-    return output.trim() !== "";
+  private onlyManifestIsConflicted(filePaths: string[]) {
+    const manifestPath = this.repoPath(
+      `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
+    );
+    return filePaths.length > 0 && filePaths.every((filePath) => filePath === manifestPath);
   }
 
   private async commitWorkingTreeChanges(message: string) {
@@ -883,17 +886,15 @@ export default class GitCliSync {
         },
         async (error, stdout, stderr) => {
           if (error) {
-            const stderrText = Buffer.isBuffer(stderr)
-              ? stderr.toString("utf8")
-              : stderr;
+            const message = getGitErrorMessage(stderr, stdout, error.code);
             if (logErrors) {
               await this.logger.error("Git command failed", {
                 args,
                 cwd,
-                stderr: stderrText,
+                output: message,
               });
             }
-            reject(new GitCliError(stderrText || error.message));
+            reject(new GitCliError(message));
             return;
           }
           resolve({ stdout, stderr });
