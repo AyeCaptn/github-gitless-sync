@@ -256,19 +256,26 @@ export default class GitCliSync {
         try {
           await this.runGit(["merge", "--no-edit", this.remoteTrackingRef()], false);
         } catch (mergeErr) {
-          const conflictedPaths = await this.getConflictedPaths();
-          if (this.onlyManifestIsConflicted(conflictedPaths)) {
+          const mergeHead = await this.getOptionalRefSha("MERGE_HEAD");
+          if (mergeHead === null) {
+            throw mergeErr;
+          }
+
+          const manifestPath = this.repoPath(
+            `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
+          );
+          if (await this.isPathConflicted(manifestPath)) {
             await this.runGit([
               "checkout",
               "--theirs",
               "--",
-              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
+              manifestPath,
             ]);
-            await this.runGit([
-              "add",
-              "--",
-              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
-            ]);
+            await this.runGit(["add", "--", manifestPath]);
+          }
+
+          const conflictedPaths = await this.getConflictedPaths();
+          if (conflictedPaths.length === 0) {
             await this.runGit([
               "-c",
               "user.name=GitHub Gitless Sync",
@@ -553,11 +560,9 @@ export default class GitCliSync {
       .filter((filePath) => filePath !== "");
   }
 
-  private onlyManifestIsConflicted(filePaths: string[]) {
-    const manifestPath = this.repoPath(
-      `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
-    );
-    return filePaths.length > 0 && filePaths.every((filePath) => filePath === manifestPath);
+  private async isPathConflicted(filePath: string) {
+    const output = await this.runGitText(["ls-files", "-u", "--", filePath]);
+    return output.trim() !== "";
   }
 
   private async commitWorkingTreeChanges(message: string) {

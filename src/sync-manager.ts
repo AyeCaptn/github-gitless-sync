@@ -1070,6 +1070,15 @@ export default class SyncManager {
   }
 
   private async syncWithGitCli(gitCliSync: GitCliSync) {
+    await this.eventsListener.pause();
+    try {
+      await this.syncWithGitCliImpl(gitCliSync);
+    } finally {
+      this.eventsListener.resume();
+    }
+  }
+
+  private async syncWithGitCliImpl(gitCliSync: GitCliSync) {
     await this.refreshSyncPathFilter();
     await this.pruneUnsyncableMetadata();
 

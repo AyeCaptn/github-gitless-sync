@@ -9,6 +9,9 @@ import SyncPathFilter from "./sync-path-filter";
  * Tracks changes to local sync directory and updates files metadata.
  */
 export default class EventsListener {
+  private paused = false;
+  private pendingEvents = new Set<Promise<void>>();
+
   constructor(
     private vault: Vault,
     private metadataStore: MetadataStore,
@@ -21,10 +24,48 @@ export default class EventsListener {
     // We need to register all the events we subscribe to so they can
     // be correctly detached when the plugin is unloaded too.
     // If we don't they might be left hanging and cause issues.
-    plugin.registerEvent(this.vault.on("create", this.onCreate.bind(this)));
-    plugin.registerEvent(this.vault.on("delete", this.onDelete.bind(this)));
-    plugin.registerEvent(this.vault.on("modify", this.onModify.bind(this)));
-    plugin.registerEvent(this.vault.on("rename", this.onRename.bind(this)));
+    plugin.registerEvent(
+      this.vault.on("create", (file) =>
+        this.trackEvent(() => this.onCreate(file)),
+      ),
+    );
+    plugin.registerEvent(
+      this.vault.on("delete", (file) =>
+        this.trackEvent(() => this.onDelete(file)),
+      ),
+    );
+    plugin.registerEvent(
+      this.vault.on("modify", (file) =>
+        this.trackEvent(() => this.onModify(file)),
+      ),
+    );
+    plugin.registerEvent(
+      this.vault.on("rename", (file, oldPath) =>
+        this.trackEvent(() => this.onRename(file, oldPath)),
+      ),
+    );
+  }
+
+  async pause() {
+    this.paused = true;
+    await Promise.all(
+      Array.from(this.pendingEvents).map((event) =>
+        event.catch(() => undefined),
+      ),
+    );
+  }
+
+  resume() {
+    this.paused = false;
+  }
+
+  private trackEvent(callback: () => Promise<void>) {
+    if (this.paused) return;
+
+    let event: Promise<void>;
+    event = callback().finally(() => this.pendingEvents.delete(event));
+    this.pendingEvents.add(event);
+    return event;
   }
 
   private async onCreate(file: TAbstractFile) {
