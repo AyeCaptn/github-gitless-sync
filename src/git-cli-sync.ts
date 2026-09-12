@@ -264,19 +264,12 @@ export default class GitCliSync {
         try {
           await this.runGit(["merge", "--no-edit", this.remoteTrackingRef()], false);
         } catch (mergeErr) {
+          const mergeHead = await this.getOptionalRefSha("MERGE_HEAD");
+          const manifestResolved =
+            mergeHead !== null && (await this.resolveManifestConflict());
           const conflictedPaths = await this.getConflictedPaths();
-          if (this.onlyManifestIsConflicted(conflictedPaths)) {
-            await this.runGit([
-              "checkout",
-              "--theirs",
-              "--",
-              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
-            ]);
-            await this.runGit([
-              "add",
-              "--",
-              this.repoPath(`${this.vault.configDir}/${MANIFEST_FILE_NAME}`),
-            ]);
+
+          if (manifestResolved && conflictedPaths.length === 0) {
             await this.runGit([
               "-c",
               "user.name=GitHub Gitless Sync",
@@ -285,9 +278,14 @@ export default class GitCliSync {
               "commit",
               "--no-edit",
             ]);
+            await this.logger.info("Automatically resolved sync metadata conflict");
           } else {
             await this.runGit(["merge", "--abort"], false).catch(() => undefined);
-            throw mergeErr;
+            const unresolved =
+              conflictedPaths.length > 0
+                ? ` Unresolved conflicts: ${conflictedPaths.join(", ")}.`
+                : "";
+            throw new GitCliError(`${String(mergeErr)}${unresolved}`);
           }
         }
       }
@@ -561,11 +559,18 @@ export default class GitCliSync {
       .filter((filePath) => filePath !== "");
   }
 
-  private onlyManifestIsConflicted(filePaths: string[]) {
+  private async resolveManifestConflict() {
     const manifestPath = this.repoPath(
       `${this.vault.configDir}/${MANIFEST_FILE_NAME}`,
     );
-    return filePaths.length > 0 && filePaths.every((filePath) => filePath === manifestPath);
+
+    try {
+      await this.runGit(["checkout", "--theirs", "--", manifestPath], false);
+      await this.runGit(["add", "--", manifestPath]);
+      return true;
+    } catch (_err) {
+      return false;
+    }
   }
 
   private async commitWorkingTreeChanges(message: string) {

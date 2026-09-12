@@ -17,7 +17,11 @@ const require = createRequire(import.meta.url);
 const proxyquire = require("proxyquire").noCallThru();
 
 class TestLogger {
-  async info() {}
+  messages: string[] = [];
+
+  async info(message: string) {
+    this.messages.push(message);
+  }
   async error() {}
 }
 
@@ -63,7 +67,7 @@ test("reports Git output without exposing the authenticated command", () => {
   assert.equal(fallback, "Git exited with code 1");
 });
 
-test("merges divergent branches when only sync metadata conflicts", async () => {
+test("only auto-resolves generated metadata conflicts", async () => {
   const root = mkdtempSync(join(tmpdir(), "github-gitless-sync-"));
   const bareRepo = join(root, "remote.git");
   const seedRepo = join(root, "seed");
@@ -94,7 +98,10 @@ test("merges divergent branches when only sync metadata conflicts", async () => 
     git(remoteRepo, ["commit", "-m", "remote change"]);
     git(remoteRepo, ["push", "origin", "master"]);
 
+    configureAuthor(localRepo);
     write(localRepo, manifestPath, "local metadata\n");
+    git(localRepo, ["add", manifestPath]);
+    git(localRepo, ["commit", "-m", "local metadata"]);
     write(localRepo, "local.md", "local\n");
 
     const vault = {
@@ -102,6 +109,7 @@ test("merges divergent branches when only sync metadata conflicts", async () => 
       adapter: { getBasePath: () => localRepo },
       getRoot: () => ({ path: "" }),
     };
+    const logger = new TestLogger();
     const sync = new GitCliSync(
       vault,
       {
@@ -110,7 +118,7 @@ test("merges divergent branches when only sync metadata conflicts", async () => 
         githubBranch: "master",
         githubToken: "token",
       },
-      new TestLogger(),
+      logger,
     );
 
     sync.repoDir = localRepo;
@@ -124,10 +132,35 @@ test("merges divergent branches when only sync metadata conflicts", async () => 
     assert.equal(readFileSync(join(localRepo, manifestPath), "utf8"), "remote metadata\n");
     assert.equal(readFileSync(join(localRepo, "local.md"), "utf8"), "local\n");
     assert.equal(readFileSync(join(localRepo, "remote.md"), "utf8"), "remote\n");
+    assert.ok(
+      logger.messages.includes("Automatically resolved sync metadata conflict"),
+    );
     assert.equal(
       git(localRepo, ["rev-list", "--parents", "-n", "1", "HEAD"]).split(" ")
         .length,
       3,
+    );
+
+    git(localRepo, ["push", "origin", "master"]);
+    git(remoteRepo, ["pull", "--ff-only"]);
+    write(remoteRepo, "conflict.md", "remote\n");
+    git(remoteRepo, ["add", "conflict.md"]);
+    git(remoteRepo, ["commit", "-m", "remote note"]);
+    git(remoteRepo, ["push", "origin", "master"]);
+    write(localRepo, "conflict.md", "local\n");
+
+    await assert.rejects(
+      sync.syncBranch("local note"),
+      /Unresolved conflicts: conflict\.md/,
+    );
+
+    assert.equal(git(localRepo, ["status", "--porcelain"]), "");
+    assert.equal(readFileSync(join(localRepo, "conflict.md"), "utf8"), "local\n");
+    assert.equal(
+      logger.messages.filter(
+        (message) => message === "Automatically resolved sync metadata conflict",
+      ).length,
+      1,
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
