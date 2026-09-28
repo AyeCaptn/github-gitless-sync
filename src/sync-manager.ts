@@ -24,6 +24,11 @@ import GitHubSyncPlugin from "./main";
 import { BlobReader, Entry, Uint8ArrayWriter, ZipReader } from "@zip.js/zip.js";
 import GitCliSync from "./git-cli-sync";
 import SyncPathFilter from "./sync-path-filter";
+import {
+  getDeletionSyncAction,
+  isContentConflict,
+  tryThreeWayMerge,
+} from "./conflict-resolution";
 
 interface SyncAction {
   type: "upload" | "download" | "delete_local" | "delete_remote";
@@ -348,6 +353,47 @@ export default class SyncManager {
       await this.metadataStore.save();
       await this.logger.info(
         "Recovered local metadata from confirmed remote files",
+      );
+    }
+  }
+
+  /**
+   * Recover from missed or delayed delete events. This is particularly
+   * important on mobile, where the filesystem may change while Obsidian is
+   * suspended and no vault event is delivered to the plugin.
+   */
+  private async reconcileMissingLocalFiles() {
+    const manifestPath = `${this.vault.configDir}/${MANIFEST_FILE_NAME}`;
+    const deletedAt = Date.now();
+    const missingPaths = (
+      await Promise.all(
+        Object.keys(this.metadataStore.data.files).map(
+          async (filePath: string): Promise<string | null> => {
+            const file = this.metadataStore.data.files[filePath];
+            if (
+              filePath === manifestPath ||
+              file.deleted ||
+              !this.shouldSyncPath(filePath, { includeManifest: false }) ||
+              (await this.vault.adapter.exists(normalizePath(filePath)))
+            ) {
+              return null;
+            }
+
+            file.deleted = true;
+            file.deletedAt = deletedAt;
+            file.dirty = true;
+            file.justDownloaded = false;
+            return filePath;
+          },
+        ),
+      )
+    ).filter((filePath): filePath is string => filePath !== null);
+
+    if (missingPaths.length > 0) {
+      await this.metadataStore.save();
+      await this.logger.info(
+        "Recovered missed local file deletions",
+        missingPaths,
       );
     }
   }
@@ -917,6 +963,7 @@ export default class SyncManager {
       await this.getEffectiveRemoteMetadata(files);
 
     await this.reconcileMatchingLocalFiles(remoteMetadata);
+    await this.reconcileMissingLocalFiles();
 
     if (metadataNeedsUpdate) {
       await this.logger.warn(
@@ -931,27 +978,49 @@ export default class SyncManager {
       );
     }
 
-    const conflicts = await this.findConflicts(remoteMetadata.files);
+    let conflicts = await this.findConflicts(remoteMetadata.files);
+    const automaticResolutions =
+      this.settings.conflictHandling === "ask"
+        ? await this.findAutomaticConflictResolutions(conflicts)
+        : [];
+    if (automaticResolutions.length > 0) {
+      const automaticallyResolvedPaths = new Set(
+        automaticResolutions.map((resolution) => resolution.filePath),
+      );
+      conflicts = conflicts.filter(
+        (conflict) => !automaticallyResolvedPaths.has(conflict.filePath),
+      );
+      await this.logger.info(
+        "Automatically merged non-overlapping changes",
+        Array.from(automaticallyResolvedPaths),
+      );
+    }
 
     // We treat every resolved conflict as an upload SyncAction, mainly cause
     // the user has complete freedom on the edits they can apply to the conflicting files.
     // So when a conflict is resolved we change the file locally and upload it.
     // That solves the conflict.
-    let conflictActions: SyncAction[] = [];
+    let conflictActions: SyncAction[] = automaticResolutions.map(
+      (resolution) => ({
+        type: "upload" as const,
+        filePath: resolution.filePath,
+      }),
+    );
     // We keep track of the conflict resolutions cause we want to update the file
     // locally only when we're sure the sync was successul. That happens after we
     // commit the sync.
-    let conflictResolutions: ConflictResolution[] = [];
+    let conflictResolutions: ConflictResolution[] = automaticResolutions;
 
     if (conflicts.length > 0) {
       await this.logger.warn("Found conflicts", conflicts);
       if (this.settings.conflictHandling === "ask") {
         // Here we block the sync process until the user has resolved all the conflicts
-        conflictResolutions = await this.onConflicts(conflicts);
-        conflictActions = conflictResolutions.map(
-          (resolution: ConflictResolution) => {
-            return { type: "upload", filePath: resolution.filePath };
-          },
+        const manualResolutions = await this.onConflicts(conflicts);
+        conflictResolutions = [...conflictResolutions, ...manualResolutions];
+        conflictActions.push(
+          ...manualResolutions.map((resolution: ConflictResolution) => {
+            return { type: "upload" as const, filePath: resolution.filePath };
+          }),
         );
       } else if (this.settings.conflictHandling === "overwriteLocal") {
         // The user explicitly wants to always overwrite the local file
@@ -1253,27 +1322,48 @@ export default class SyncManager {
 
     const { metadata: remoteMetadata, metadataNeedsUpdate, remoteDriftFiles } =
       await this.getEffectiveRemoteMetadata(files);
-    const conflicts = await this.findConflicts(remoteMetadata.files);
+    await this.reconcileMissingLocalFiles();
+    let conflicts = await this.findConflicts(remoteMetadata.files);
+    const automaticResolutions =
+      this.settings.conflictHandling === "ask"
+        ? await this.findAutomaticConflictResolutions(conflicts)
+        : [];
+    const automaticallyResolvedPaths = new Set(
+      automaticResolutions.map((resolution) => resolution.filePath),
+    );
+    conflicts = conflicts.filter(
+      (conflict) => !automaticallyResolvedPaths.has(conflict.filePath),
+    );
     const actions = await this.determineSyncActions(
       remoteMetadata.files,
       this.metadataStore.data.files,
-      conflicts.map((conflict) => conflict.filePath),
+      [
+        ...conflicts.map((conflict) => conflict.filePath),
+        ...automaticallyResolvedPaths,
+      ],
     );
+    const plannedActions: SyncAction[] = [
+      ...actions,
+      ...automaticResolutions.map((resolution) => ({
+        type: "upload" as const,
+        filePath: resolution.filePath,
+      })),
+    ];
 
     return {
-      uploads: actions
+      uploads: plannedActions
         .filter((action) => action.type === "upload")
         .map((action) => action.filePath)
         .sort(),
-      downloads: actions
+      downloads: plannedActions
         .filter((action) => action.type === "download")
         .map((action) => action.filePath)
         .sort(),
-      deleteLocal: actions
+      deleteLocal: plannedActions
         .filter((action) => action.type === "delete_local")
         .map((action) => action.filePath)
         .sort(),
-      deleteRemote: actions
+      deleteRemote: plannedActions
         .filter((action) => action.type === "delete_remote")
         .map((action) => action.filePath)
         .sort(),
@@ -1337,26 +1427,8 @@ export default class SyncManager {
         }
         const remoteFile = filesMetadata[filePath];
         const localFile = this.metadataStore.data.files[filePath];
-        if (remoteFile.deleted && localFile.deleted) {
-          return null;
-        }
         const actualLocalSHA = await this.calculateSHA(filePath);
-        const remoteFileHasBeenModifiedSinceLastSync =
-          remoteFile.sha !== localFile.sha;
-        const localFileHasBeenModifiedSinceLastSync =
-          actualLocalSHA !== localFile.sha;
-        // This is an unlikely case. If the user manually edits
-        // the local file so that's identical to the remote one,
-        // but the local metadata SHA is different we don't want
-        // to show a conflict.
-        // Since that would show two identical files.
-        // Checking for this prevents showing a non conflict to the user.
-        const actualFilesAreDifferent = remoteFile.sha !== actualLocalSHA;
-        if (
-          remoteFileHasBeenModifiedSinceLastSync &&
-          localFileHasBeenModifiedSinceLastSync &&
-          actualFilesAreDifferent
-        ) {
+        if (isContentConflict(remoteFile, localFile, actualLocalSHA)) {
           return filePath;
         }
         return null;
@@ -1397,6 +1469,52 @@ export default class SyncManager {
     );
   }
 
+  private async findAutomaticConflictResolutions(
+    conflicts: ConflictFile[],
+  ): Promise<ConflictResolution[]> {
+    const resolutions = await Promise.all(
+      conflicts.map(async (conflict): Promise<ConflictResolution | null> => {
+        if (!hasTextExtension(conflict.filePath)) {
+          return null;
+        }
+
+        const baseSha = this.metadataStore.data.files[conflict.filePath]?.sha;
+        if (baseSha === null || baseSha === undefined) {
+          return null;
+        }
+
+        try {
+          const baseBlob = await this.getBlob({ sha: baseSha, retry: true });
+          const mergedContent = tryThreeWayMerge(
+            conflict.localContent,
+            decodeBase64String(baseBlob.content),
+            conflict.remoteContent,
+          );
+          if (mergedContent === null) {
+            return null;
+          }
+
+          return {
+            filePath: conflict.filePath,
+            content: mergedContent,
+          };
+        } catch (err) {
+          // If an old base blob is unavailable, retain the existing manual
+          // conflict workflow instead of failing the whole sync.
+          await this.logger.warn(
+            `Could not automatically merge ${conflict.filePath}`,
+            err,
+          );
+          return null;
+        }
+      }),
+    );
+
+    return resolutions.filter(
+      (resolution): resolution is ConflictResolution => resolution !== null,
+    );
+  }
+
   /**
    * Determines which sync action to take for each file.
    *
@@ -1433,43 +1551,25 @@ export default class SyncManager {
           return;
         }
 
-        const localSHA = await this.calculateSHA(filePath);
+        const localSHA = localFile.deleted
+          ? null
+          : await this.calculateSHA(filePath);
+        const deletionAction = getDeletionSyncAction(
+          remoteFile,
+          localFile,
+          localSHA,
+        );
+        if (deletionAction !== null) {
+          actions.push({ type: deletionAction, filePath: filePath });
+          return;
+        }
+
         if (remoteFile.sha === localSHA) {
           // If the remote file sha is identical to the actual sha of the local file
           // there are no actions to take.
           // We calculate the SHA at the moment instead of using the one stored in the
           // metadata file cause we update that only when the file is uploaded or downloaded.
           return;
-        }
-
-        if (remoteFile.deleted && !localFile.deleted) {
-          if ((remoteFile.deletedAt as number) > localFile.lastModified) {
-            actions.push({
-              type: "delete_local",
-              filePath: filePath,
-            });
-            return;
-          } else if (
-            localFile.lastModified > (remoteFile.deletedAt as number)
-          ) {
-            actions.push({ type: "upload", filePath: filePath });
-            return;
-          }
-        }
-
-        if (!remoteFile.deleted && localFile.deleted) {
-          if (remoteFile.lastModified > (localFile.deletedAt as number)) {
-            actions.push({ type: "download", filePath: filePath });
-            return;
-          } else if (
-            (localFile.deletedAt as number) > remoteFile.lastModified
-          ) {
-            actions.push({
-              type: "delete_remote",
-              filePath: filePath,
-            });
-            return;
-          }
         }
 
         // For non-deletion cases, if SHAs differ, we just need to check if local changed.
@@ -1798,7 +1898,12 @@ export default class SyncManager {
 
   async downloadFile(file: GetTreeResponseItem, lastModified: number) {
     const fileMetadata = this.metadataStore.data.files[file.path];
-    if (fileMetadata && fileMetadata.sha === file.sha) {
+    if (
+      fileMetadata &&
+      !fileMetadata.deleted &&
+      fileMetadata.sha === file.sha &&
+      (await this.vault.adapter.exists(normalizePath(file.path)))
+    ) {
       // File already exists and has the same SHA, no need to download it again.
       return;
     }

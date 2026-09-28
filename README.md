@@ -81,8 +81,8 @@ The `Sync with GitHub` command is also available.
 
 When you sync multiple vaults using this plugin you might risk creating conflicts between the remote and a local vault.
 This usually happens when the remote has a new update from vault A, but vault B edits the file before syncing with remote.
-That creates a conflict, by default we'll open a view to let you resolve the conflict since you should have all the necessary
-information to correctly resolve it.
+The plugin automatically performs a three-way merge when those edits affect different lines. If both sides edit overlapping
+lines, by default we'll open a view with the remaining conflict so you can resolve it manually.
 
 By default the split view will be used on desktop and the unified one on mobile, you can change the settings to always use the one you prefer.
 
