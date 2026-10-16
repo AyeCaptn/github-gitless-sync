@@ -2,6 +2,13 @@ import { Vault, normalizePath } from "obsidian";
 
 export const LOG_FILE_NAME = "github-sync.log" as const;
 
+export interface ErrorLogEntry {
+  timestamp: string;
+  level: "ERROR";
+  message: string;
+  additional_data?: unknown;
+}
+
 export default class Logger {
   private logFile: string;
 
@@ -42,6 +49,30 @@ export default class Logger {
 
   async read(): Promise<string> {
     return await this.vault.adapter.read(this.logFile);
+  }
+
+  async getRecentErrors(): Promise<ErrorLogEntry[]> {
+    const lines = (await this.read()).split("\n");
+    const errors: ErrorLogEntry[] = [];
+
+    for (let i = lines.length - 1; i >= 0 && errors.length < 10; i--) {
+      let entry;
+      try {
+        entry = JSON.parse(lines[i]);
+      } catch {
+        // Ignore incomplete log entries, for example after an interrupted write.
+        continue;
+      }
+      if (
+        entry?.level === "ERROR" &&
+        typeof entry.timestamp === "string" &&
+        typeof entry.message === "string"
+      ) {
+        errors.push(entry);
+      }
+    }
+
+    return errors;
   }
 
   async clean(): Promise<void> {
