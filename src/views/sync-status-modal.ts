@@ -1,27 +1,44 @@
-import { App, Modal } from "obsidian";
+import { App, Modal, Notice } from "obsidian";
+import type Logger from "src/logger";
 import type { SyncStatus } from "src/sync-manager";
+import { copyToClipboard } from "src/utils";
 
 export default class SyncStatusModal extends Modal {
   constructor(
     app: App,
-    private status: SyncStatus,
+    private status: SyncStatus | null,
+    private logger: Logger,
+    private statusError?: string,
   ) {
     super(app);
   }
 
-  onOpen() {
+  async onOpen() {
     const { contentEl } = this;
     contentEl.empty();
 
     this.setTitle("GitHub sync status");
 
+    if (this.status) {
+      this.renderStatus(this.status);
+    } else {
+      contentEl.createEl("p", {
+        text: `Unable to load current sync status. ${this.statusError}`,
+      });
+    }
+
+    await this.renderErrors();
+  }
+
+  private renderStatus(status: SyncStatus) {
+    const { contentEl } = this;
     if (
-      this.status.uploads.length === 0 &&
-      this.status.downloads.length === 0 &&
-      this.status.deleteLocal.length === 0 &&
-      this.status.deleteRemote.length === 0 &&
-      this.status.conflicts.length === 0 &&
-      !this.status.metadataNeedsUpdate
+      status.uploads.length === 0 &&
+      status.downloads.length === 0 &&
+      status.deleteLocal.length === 0 &&
+      status.deleteRemote.length === 0 &&
+      status.conflicts.length === 0 &&
+      !status.metadataNeedsUpdate
     ) {
       contentEl.createEl("p", {
         text: "Everything is up to date.",
@@ -29,8 +46,8 @@ export default class SyncStatusModal extends Modal {
       return;
     }
 
-    if (this.status.metadataNeedsUpdate) {
-      const changes = this.status.remoteDriftFiles.length;
+    if (status.metadataNeedsUpdate) {
+      const changes = status.remoteDriftFiles.length;
       contentEl.createEl("p", {
         text:
           changes > 0
@@ -41,29 +58,77 @@ export default class SyncStatusModal extends Modal {
 
     this.renderSection(
       "Pending uploads",
-      this.status.uploads,
+      status.uploads,
       "Local files that will be uploaded to GitHub.",
     );
     this.renderSection(
       "Pending downloads",
-      this.status.downloads,
+      status.downloads,
       "Remote files that will be downloaded into this vault.",
     );
     this.renderSection(
       "Pending local deletions",
-      this.status.deleteLocal,
+      status.deleteLocal,
       "Local files that will be deleted to match GitHub.",
     );
     this.renderSection(
       "Pending remote deletions",
-      this.status.deleteRemote,
+      status.deleteRemote,
       "Remote files that will be deleted on GitHub.",
     );
     this.renderSection(
       "Conflicts",
-      this.status.conflicts,
+      status.conflicts,
       "Files changed both locally and remotely and requiring conflict handling.",
     );
+  }
+
+  private async renderErrors() {
+    const section = this.contentEl.createDiv();
+    section.createEl("h3", { text: "Recent errors (last 10)" });
+    section.createEl("p", {
+      text: "Newest first. Tap an error to copy its full details.",
+    });
+
+    let errors;
+    try {
+      errors = await this.logger.getRecentErrors();
+    } catch (err) {
+      section.createEl("p", { text: `Unable to read error history. ${err}` });
+      return;
+    }
+
+    if (errors.length === 0) {
+      section.createEl("p", { text: "No errors recorded." });
+      return;
+    }
+
+    const list = section.createEl("ul", { cls: "github-sync-errors" });
+    for (const error of errors) {
+      const button = list.createEl("li").createEl("button", {
+        cls: "github-sync-error",
+        attr: { type: "button", "aria-label": `Copy error: ${error.message}` },
+      });
+      button.createEl("small", { text: error.timestamp });
+      button.createEl("strong", { text: error.message });
+      if (error.additional_data !== undefined) {
+        button.createEl("span", {
+          cls: "github-sync-error-details",
+          text:
+            typeof error.additional_data === "string"
+              ? error.additional_data
+              : JSON.stringify(error.additional_data, null, 2),
+        });
+      }
+      button.addEventListener("click", async () => {
+        try {
+          await copyToClipboard(JSON.stringify(error, null, 2));
+          new Notice("Error details copied to clipboard.");
+        } catch {
+          new Notice("Unable to copy error details to clipboard.");
+        }
+      });
+    }
   }
 
   private renderSection(title: string, files: string[], description: string) {

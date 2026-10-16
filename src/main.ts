@@ -419,9 +419,9 @@ export default class GitHubSyncPlugin extends Plugin {
     const loadingNotice = new Notice("Loading sync status...");
     try {
       const status = await this.syncManager.getSyncStatus();
-      new SyncStatusModal(this.app, status).open();
+      new SyncStatusModal(this.app, status, this.logger).open();
     } catch (err) {
-      new Notice(`Error loading sync status. ${err}`);
+      new SyncStatusModal(this.app, null, this.logger, String(err)).open();
     } finally {
       loadingNotice.hide();
     }
