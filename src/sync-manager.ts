@@ -9,6 +9,7 @@ import GithubClient, {
   GetTreeResponseItem,
   NewTreeRequestItem,
   RepoContent,
+  RemoteBranchChangedError,
 } from "./github/client";
 import MetadataStore, {
   FileMetadata,
@@ -138,25 +139,13 @@ export default class SyncManager {
   private async getStableRepoContent(): Promise<
     RepoContent & { branchHeadSha: string }
   > {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
-      const content = await this.client.getRepoContent({ retry: true });
-      const confirmedBranchHeadSha = await this.client.getBranchHeadSha({
-        retry: true,
-      });
-
-      if (branchHeadSha === confirmedBranchHeadSha) {
-        return { ...content, branchHeadSha };
-      }
-
-      await this.logger.warn(
-        "Remote branch changed while loading repository, retrying",
-      );
-    }
-
-    throw new Error(
-      "Remote branch kept changing while preparing sync. Please sync again.",
-    );
+    const branchHeadSha = await this.client.getBranchHeadSha({ retry: true });
+    // Pin the tree to its parent commit, not a branch that can move mid-request.
+    const content = await this.client.getRepoContent({
+      ref: branchHeadSha,
+      retry: true,
+    });
+    return { ...content, branchHeadSha };
   }
 
   private async assertBranchHead(expectedBranchHeadSha: string) {
@@ -164,9 +153,23 @@ export default class SyncManager {
       retry: true,
     });
     if (currentBranchHeadSha !== expectedBranchHeadSha) {
-      throw new Error(
-        "Remote branch changed during sync. Please sync again to reconcile the latest changes.",
-      );
+      throw new RemoteBranchChangedError();
+    }
+  }
+
+  private async retryBranchChanges(sync: (attempt: number) => Promise<void>) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await sync(attempt);
+        return;
+      } catch (err) {
+        if (!(err instanceof RemoteBranchChangedError) || attempt >= 2) {
+          throw err;
+        }
+        await this.logger.warn(
+          "Remote branch changed, reconciling the latest changes and retrying sync",
+        );
+      }
     }
   }
 
@@ -468,7 +471,11 @@ export default class SyncManager {
 
     this.syncing = true;
     try {
-      await this.firstSyncImpl();
+      // After a first-sync race, use the per-file bases already reconciled or
+      // downloaded instead of treating the vault as an unrelated initial copy.
+      await this.retryBranchChanges((attempt) =>
+        attempt === 0 ? this.firstSyncImpl() : this.syncImpl(),
+      );
     } catch (err) {
       this.syncing = false;
       await this.logger.error("First sync failed", String(err));
@@ -745,7 +752,9 @@ export default class SyncManager {
       // We want to avoid getting throttled by GitHub, so instead of making a request for each
       // file we download the whole repository as a ZIP file and extract it in the vault.
       // We exclude config dir files if the user doesn't want to sync those.
-      const zipBuffer = await this.client.downloadRepositoryArchive();
+      const zipBuffer = await this.client.downloadRepositoryArchive({
+        ref: expectedBranchHeadSha,
+      });
       const zipBlob = new Blob([zipBuffer]);
       const reader = new ZipReader(new BlobReader(zipBlob));
       const entries = await reader.getEntries();
@@ -918,7 +927,7 @@ export default class SyncManager {
     const notice = new Notice("Syncing...");
     this.syncing = true;
     try {
-      await this.syncImpl();
+      await this.retryBranchChanges(() => this.syncImpl());
       // Shown only if sync doesn't fail
       new Notice("Sync successful", 5000);
     } catch (err) {

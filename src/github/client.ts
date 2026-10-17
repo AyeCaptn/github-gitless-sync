@@ -64,6 +64,15 @@ class GithubAPIError extends Error {
   }
 }
 
+export class RemoteBranchChangedError extends Error {
+  constructor() {
+    super(
+      "Remote branch changed during sync. Please sync again to reconcile the latest changes.",
+    );
+    this.name = "RemoteBranchChangedError";
+  }
+}
+
 export default class GithubClient {
   constructor(
     private settings: GitHubSyncSettings,
@@ -143,13 +152,14 @@ export default class GithubClient {
    * @returns Array of files in the directory in the remote repo
    */
   async getRepoContent({
+    ref = this.settings.githubBranch,
     retry = false,
     maxRetries = 5,
   } = {}): Promise<RepoContent> {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `${this.repoBaseUrl()}/git/trees/${this.encodedBranch()}?recursive=1`,
+          url: `${this.repoBaseUrl()}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
           headers: this.headers(),
           throw: false,
         });
@@ -323,6 +333,7 @@ export default class GithubClient {
           method: "PATCH",
           body: JSON.stringify({
             sha: sha,
+            force: false,
           }),
           throw: false,
         });
@@ -334,6 +345,13 @@ export default class GithubClient {
       this.retryDelay,
     );
 
+    if (
+      (response.status === 409 || response.status === 422) &&
+      /not a fast forward/i.test(this.errorMessage(response))
+    ) {
+      // Retrying this PATCH cannot succeed: sync must reconcile a new snapshot.
+      throw new RemoteBranchChangedError();
+    }
     if (response.status < 200 || response.status >= 400) {
       return await this.throwApiError(
         "Failed to update branch head sha",
@@ -481,13 +499,14 @@ export default class GithubClient {
    * @returns The archive contents as an ArrayBuffer
    */
   async downloadRepositoryArchive({
+    ref = this.settings.githubBranch,
     retry = false,
     maxRetries = 5,
   } = {}): Promise<ArrayBuffer> {
     const response = await retryUntil(
       async () => {
         return requestUrl({
-          url: `${this.repoBaseUrl()}/zipball/${this.encodedBranch()}`,
+          url: `${this.repoBaseUrl()}/zipball/${encodeURIComponent(ref)}`,
           headers: this.headers(),
           method: "GET",
           throw: false,
