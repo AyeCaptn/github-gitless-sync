@@ -6,7 +6,11 @@ import {
   apiVersion,
   requireApiVersion,
 } from "obsidian";
-import { GitHubSyncSettings, DEFAULT_SETTINGS } from "./settings/settings";
+import {
+  GitHubSyncSettings,
+  DEFAULT_SETTINGS,
+  normalizeSyncInterval,
+} from "./settings/settings";
 import GitHubSyncSettingsTab from "./settings/tab";
 import SyncManager, { ConflictFile, ConflictResolution } from "./sync-manager";
 import SyncStatusModal from "./views/sync-status-modal";
@@ -43,6 +47,13 @@ export default class GitHubSyncPlugin extends Plugin {
   // and it gets destroyed.
   // By keeping them here we can recreate it easily.
   private conflicts: ConflictFile[] = [];
+  private syncInProgress = false;
+  private backgroundSync = false;
+  private rejectConflicts: ((error: Error) => void) | null = null;
+  private layoutReady = false;
+  private unloaded = false;
+  private syncIntervalId: number | null = null;
+  private lastAutomaticSync = 0;
 
   async onUserEnable() {
     if (
@@ -154,7 +165,7 @@ export default class GitHubSyncPlugin extends Plugin {
     }
 
     this.logger = new Logger(this.app.vault, this.settings.enableLogging);
-    this.logger.init();
+    await this.logger.init();
 
     this.registerView(
       CONFLICTS_RESOLUTION_VIEW_TYPE,
@@ -172,11 +183,9 @@ export default class GitHubSyncPlugin extends Plugin {
     this.fileExplorerBadges = new FileExplorerBadges(this.syncManager);
     await this.syncManager.loadMetadata();
 
-    if (this.settings.syncStrategy == "interval") {
-      this.restartSyncInterval();
-    }
-
     this.app.workspace.onLayoutReady(async () => {
+      if (this.unloaded) return;
+      this.layoutReady = true;
       // Create the events handling only after tha layout is ready to avoid
       // getting spammed with create events.
       // See the official Obsidian docs:
@@ -201,10 +210,18 @@ export default class GitHubSyncPlugin extends Plugin {
         this.showFileExplorerBadges();
       }
 
+      this.lastAutomaticSync = Date.now();
+      this.restartSyncInterval();
       if (this.settings.syncOnStartup) {
-        void this.sync();
+        void this.sync(true);
       }
     });
+
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "visible") void this.runAutomaticSync();
+    });
+    this.registerDomEvent(window, "focus", () => void this.runAutomaticSync());
+    this.registerDomEvent(window, "online", () => void this.runAutomaticSync(true));
 
     this.registerEvent(
       this.app.vault.on("delete", () => this.refreshExplorerBadges()),
@@ -221,7 +238,7 @@ export default class GitHubSyncPlugin extends Plugin {
       name: "Sync with GitHub",
       repeatable: false,
       icon: "refresh-cw",
-      callback: this.sync.bind(this),
+      callback: () => void this.sync(),
     });
 
     this.addCommand({
@@ -241,46 +258,74 @@ export default class GitHubSyncPlugin extends Plugin {
     });
   }
 
-  async sync() {
+  async sync(background = false): Promise<boolean> {
+    if (this.unloaded || this.syncInProgress) return false;
     if (!this.isAppVersionSupported()) {
-      new Notice(
-        `Please update Obsidian on this device to ${this.manifest.minAppVersion} or newer before syncing.`,
-      );
-      return;
+      if (!background) {
+        new Notice(
+          `Please update Obsidian on this device to ${this.manifest.minAppVersion} or newer before syncing.`,
+        );
+      }
+      return false;
+    }
+    if (
+      !this.settings.githubToken ||
+      !this.settings.githubOwner ||
+      !this.settings.githubRepo ||
+      !this.settings.githubBranch
+    ) {
+      if (!background) new Notice("Sync plugin not configured");
+      return false;
     }
 
-    if (
-      this.settings.githubToken === "" ||
-      this.settings.githubOwner === "" ||
-      this.settings.githubRepo === "" ||
-      this.settings.githubBranch === ""
-    ) {
-      new Notice("Sync plugin not configured");
-      return;
-    }
-    if (this.settings.firstSync) {
-      const notice = new Notice("Syncing...");
-      try {
-        await this.syncManager.firstSync();
+    this.syncInProgress = true;
+    this.backgroundSync = background;
+    const notice = !background && this.settings.firstSync
+      ? new Notice("Syncing...")
+      : null;
+    try {
+      if (this.settings.firstSync) {
+        const completed = await this.syncManager.firstSync();
+        if (!completed) return false;
         this.settings.firstSync = false;
         await this.saveSettings();
-        // Shown only if sync doesn't fail
-        new Notice("Sync successful", 5000);
-      } catch (err) {
-        // Show the error to the user, it's not automatically dismissed to make sure
-        // the user sees it.
-        new Notice(`Error syncing. ${err}`);
+        if (!background) new Notice("Sync successful", 5000);
+      } else {
+        return await this.syncManager.sync({ silent: background });
       }
-      notice.hide();
-    } else {
-      await this.syncManager.sync();
+      return true;
+    } catch (err) {
+      new Notice(`Error syncing. ${err}`);
+      return false;
+    } finally {
+      this.syncInProgress = false;
+      this.backgroundSync = false;
+      notice?.hide();
+      void this.updateStatusBarItem();
+      this.refreshExplorerBadges();
     }
-    this.updateStatusBarItem();
-    this.refreshExplorerBadges();
+  }
+
+  private async runAutomaticSync(force = false) {
+    if (!this.layoutReady || this.unloaded || this.syncInProgress) return;
+    if (this.settings.syncStrategy !== "interval") return;
+    const now = Date.now();
+    if (!force && now - this.lastAutomaticSync < this.settings.syncInterval * 60_000) {
+      return;
+    }
+    this.lastAutomaticSync = now;
+    await this.sync(true);
   }
 
   async onunload() {
+    this.unloaded = true;
     this.stopSyncInterval();
+    // Release a manual conflict wait so it cannot block an unloaded plugin.
+    this.rejectConflicts?.(
+      new Error("Plugin unloaded while waiting for conflict resolution"),
+    );
+    this.rejectConflicts = null;
+    this.conflictsResolver = null;
     this.hideFileExplorerBadges();
   }
 
@@ -366,7 +411,7 @@ export default class GitHubSyncPlugin extends Plugin {
     this.syncRibbonIcon = this.addRibbonIcon(
       "refresh-cw",
       "Sync with GitHub",
-      this.sync.bind(this),
+      () => void this.sync(),
     );
   }
 
@@ -398,10 +443,25 @@ export default class GitHubSyncPlugin extends Plugin {
 
   async onConflicts(conflicts: ConflictFile[]): Promise<ConflictResolution[]> {
     this.conflicts = conflicts;
-    return await new Promise(async (resolve) => {
-      this.conflictsResolver = resolve;
-      await this.activateView();
-      this.getConflictsView()?.setConflictFiles(conflicts);
+    if (this.backgroundSync || this.unloaded) {
+      throw new Error(
+        "Conflicting edits need review. Run Sync with GitHub to resolve them; both versions have been kept.",
+      );
+    }
+    return await new Promise((resolve, reject) => {
+      this.rejectConflicts = reject;
+      this.conflictsResolver = (resolutions) => {
+        this.rejectConflicts = null;
+        this.conflictsResolver = null;
+        resolve(resolutions);
+      };
+      void this.activateView().then(() => {
+        this.getConflictsView()?.setConflictFiles(conflicts);
+      }).catch((error) => {
+        this.conflictsResolver = null;
+        this.rejectConflicts = null;
+        reject(error);
+      });
     });
   }
 
@@ -437,6 +497,7 @@ export default class GitHubSyncPlugin extends Plugin {
       DEFAULT_SETTINGS,
       await this.loadData(),
     ) as GitHubSyncSettings;
+    savedSettings.syncInterval = normalizeSyncInterval(savedSettings.syncInterval);
     let token = window.localStorage.getItem(this.getTokenStorageKey()) || "";
 
     if (savedSettings.githubToken !== "") {
@@ -467,26 +528,29 @@ export default class GitHubSyncPlugin extends Plugin {
     });
   }
 
-  // Proxy methods from sync manager to ease handling the interval
-  // when settings are changed
   startSyncInterval() {
-    const intervalID = this.syncManager.startSyncInterval(
-      this.settings.syncInterval,
-    );
-    this.registerInterval(intervalID);
+    this.restartSyncInterval();
   }
 
   stopSyncInterval() {
-    this.syncManager.stopSyncInterval();
+    if (this.syncIntervalId !== null) {
+      window.clearInterval(this.syncIntervalId);
+      this.syncIntervalId = null;
+    }
   }
 
   restartSyncInterval() {
-    this.syncManager.stopSyncInterval();
-    this.syncManager.startSyncInterval(this.settings.syncInterval);
+    this.stopSyncInterval();
+    if (!this.layoutReady || this.unloaded || this.settings.syncStrategy !== "interval") return;
+    this.syncIntervalId = window.setInterval(
+      () => void this.runAutomaticSync(),
+      this.settings.syncInterval * 60_000,
+    );
   }
 
   async reset() {
-    this.settings = { ...DEFAULT_SETTINGS };
+    Object.assign(this.settings, DEFAULT_SETTINGS);
+    this.restartSyncInterval();
     window.localStorage.removeItem(this.getTokenStorageKey());
     await this.saveSettings();
     await this.syncManager.resetMetadata();

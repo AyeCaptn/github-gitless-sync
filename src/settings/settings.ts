@@ -23,9 +23,9 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   githubOwner: "",
   githubRepo: "",
   githubBranch: "main",
-  syncStrategy: "manual",
+  syncStrategy: "interval",
   syncInterval: 1,
-  syncOnStartup: false,
+  syncOnStartup: true,
   syncConfigDir: false,
   conflictHandling: "ask",
   conflictViewMode: "default",
@@ -35,3 +35,9 @@ export const DEFAULT_SETTINGS: GitHubSyncSettings = {
   showConflictsRibbonButton: true,
   enableLogging: false,
 };
+
+export function normalizeSyncInterval(value: number): number {
+  return Number.isFinite(value) && value >= 1 && value <= 1440
+    ? value
+    : 1;
+}

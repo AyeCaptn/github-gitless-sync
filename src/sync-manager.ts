@@ -66,7 +66,6 @@ export default class SyncManager {
   private client: GithubClient;
   private syncPathFilter: SyncPathFilter;
   private eventsListener: EventsListener;
-  private syncIntervalId: number | null = null;
   private gitCliSyncPromise: Promise<GitCliSync | null> | null = null;
 
   // Use to track if syncing is in progress, this ideally
@@ -466,7 +465,7 @@ export default class SyncManager {
     if (this.syncing) {
       this.logger.info("First sync already in progress");
       // We're already syncing, nothing to do
-      return;
+      return false;
     }
 
     this.syncing = true;
@@ -476,12 +475,13 @@ export default class SyncManager {
       await this.retryBranchChanges((attempt) =>
         attempt === 0 ? this.firstSyncImpl() : this.syncImpl(),
       );
+      return true;
     } catch (err) {
-      this.syncing = false;
       await this.logger.error("First sync failed", String(err));
       throw err;
+    } finally {
+      this.syncing = false;
     }
-    this.syncing = false;
   }
 
   private async firstSyncImpl() {
@@ -917,27 +917,22 @@ export default class SyncManager {
    * Syncs local and remote folders.
    * @returns
    */
-  async sync() {
-    if (this.syncing) {
-      this.logger.info("Sync already in progress");
-      // We're already syncing, nothing to do
-      return;
-    }
-
-    const notice = new Notice("Syncing...");
+  async sync({ silent = false } = {}): Promise<boolean> {
+    if (this.syncing) return false;
     this.syncing = true;
+    const notice = silent ? null : new Notice("Syncing...");
     try {
       await this.retryBranchChanges(() => this.syncImpl());
-      // Shown only if sync doesn't fail
-      new Notice("Sync successful", 5000);
+      if (!silent) new Notice("Sync successful", 5000);
+      return true;
     } catch (err) {
       await this.logger.error("Sync failed", String(err));
-      // Show the error to the user, it's not automatically dismissed to make sure
-      // the user sees it.
       new Notice(`Error syncing. ${err}`);
+      return false;
+    } finally {
+      this.syncing = false;
+      notice?.hide();
     }
-    this.syncing = false;
-    notice.hide();
   }
 
   private async syncImpl() {
@@ -2106,40 +2101,6 @@ export default class SyncManager {
 
   startEventsListener(plugin: GitHubSyncPlugin) {
     this.eventsListener.start(plugin);
-  }
-
-  /**
-   * Starts a new sync interval.
-   * Raises an error if the interval is already running.
-   */
-  startSyncInterval(minutes: number): number {
-    if (this.syncIntervalId) {
-      throw new Error("Sync interval is already running");
-    }
-    this.syncIntervalId = window.setInterval(
-      async () => await this.sync(),
-      // Sync interval is set in minutes but setInterval expects milliseconds
-      minutes * 60 * 1000,
-    );
-    return this.syncIntervalId;
-  }
-
-  /**
-   * Stops the currently running sync interval
-   */
-  stopSyncInterval() {
-    if (this.syncIntervalId) {
-      window.clearInterval(this.syncIntervalId);
-      this.syncIntervalId = null;
-    }
-  }
-
-  /**
-   * Util function that stops and restart the sync interval
-   */
-  restartSyncInterval(minutes: number) {
-    this.stopSyncInterval();
-    return this.startSyncInterval(minutes);
   }
 
   async resetMetadata() {
