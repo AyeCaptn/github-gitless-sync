@@ -107,13 +107,15 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
     }
     const intervalSettings = new Setting(containerEl)
       .setName("Sync interval")
-      .setDesc("Interval in minutes between automatic syncs")
+      .setDesc("Interval in minutes between automatic syncs (1–1440)")
       .addText((text) =>
         text
           .setPlaceholder("Interval in minutes")
           .setValue(syncInterval)
           .onChange(async (value) => {
-            this.plugin.settings.syncInterval = parseInt(value) || 1;
+            const minutes = Number(value);
+            if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) return;
+            this.plugin.settings.syncInterval = minutes;
             await this.plugin.saveSettings();
             // We need to restart the interval if the value is changed
             this.plugin.restartSyncInterval();
@@ -141,7 +143,7 @@ export default class GitHubSyncSettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Sync on startup")
-      .setDesc("Download up to date files from remote on startup")
+      .setDesc("Sync local and remote files on startup")
       .addToggle((toggle) => {
         toggle
           .setValue(this.plugin.settings.syncOnStartup)

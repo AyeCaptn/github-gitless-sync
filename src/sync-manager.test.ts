@@ -361,3 +361,17 @@ test("refreshes first-sync downloads without treating them as local edits", asyn
     conflicts: [],
   });
 });
+
+test("a silent failed sync reports failure and releases its lock for the next attempt", async () => {
+  const sync = createSync();
+  sync.onUpdate(() => { throw new Error("offline"); });
+  await sync.manager.loadMetadata();
+  const failed = await sync.manager.sync({ silent: true });
+  sync.onUpdate(() => {});
+  const retried = await sync.manager.sync({ silent: true });
+  assert.deepEqual({ failed, retried, notices: sync.notices }, {
+    failed: false,
+    retried: true,
+    notices: ["Error syncing. Error: offline"],
+  });
+});

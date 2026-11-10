@@ -66,6 +66,17 @@ I also suggest creating the token with access only to your sync repo.
 You can always sync manually by clicking the sync button in the side ribbon.
 This will always work even if sync on interval is enabled.
 
+New installations sync automatically on startup and every minute. Existing sync preferences are preserved.
+You can change the interval (1–1440 minutes) or select manual mode in settings.
+Automatic sync waits until the vault is ready, handles the initial sync, and retries on the next interval after failures.
+It catches up when you return to the app after a missed interval and when the network reconnects.
+Only one sync runs at a time; routine automatic syncs do not show progress or success notifications.
+
+Background sync runs while Obsidian is running, including an inactive desktop window.
+It cannot run after Obsidian exits or while a mobile operating system suspends the app; it catches up after resuming.
+Conflicting edits that need manual review are kept pending with an error notice instead of opening a view automatically.
+Use **Sync with GitHub** to resolve them. Automatic non-overlapping merges and your configured conflict policy still apply.
+
 On systems where `git` is installed and accessible, the plugin will automatically use the vault's real local git repository for sync operations.
 This keeps the local branch and refs in sync with GitHub instead of syncing through a temporary repository.
 In git CLI mode, the sync metadata file is regenerated from the final git state after each sync so API-based clients can keep working against the same repository.
